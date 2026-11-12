@@ -1,0 +1,3 @@
+# Versions verified on Linux/H20; install the appropriate PyTorch build separately.
+ray==2.58.0
+nixl==1.5.2

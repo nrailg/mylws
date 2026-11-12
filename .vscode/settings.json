@@ -1,0 +1,7 @@
+{
+  "files.exclude": {
+    "**/.codex": true,
+    "**/.vscode": true,
+    "**/__pycache__": true
+  }
+}
