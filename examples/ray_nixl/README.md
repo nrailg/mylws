@@ -10,7 +10,7 @@ ref = ray.put(payload, _tensor_transport="nixl")
 payload = ray.get(ref)
 ```
 
-两端都设置 `enable_tensor_transport=True`。示例默认传 CPU Tensor，也支持 CUDA Tensor。
+两端都设置 `enable_tensor_transport=True` 和 `num_gpus=1`，直接传递 CUDA Tensor，需要两张可用 GPU。
 
 ```text
 Driver ── publish() ──→ Producer
@@ -30,23 +30,21 @@ Driver 只获取引用和小型校验结果。实际 Tensor 保留在生产端�
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
+# 已有匹配驱动的 CUDA PyTorch 环境时，直接安装示例依赖。
 python -m pip install -r examples/ray_nixl/requirements.txt
-# CPU 示例：
-python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 ```
 
-CUDA 模式改用与机器驱动匹配的 [PyTorch CUDA 构建](https://pytorch.org/get-started/locally/)，不要安装上面的 CPU 构建。集群所有节点需要相同的 Python、Ray、NIXL、PyTorch 环境；UCX/NIXL 后端依赖也必须可用。
+新环境先安装与机器驱动匹配的 [PyTorch CUDA 构建](https://pytorch.org/get-started/locally/)，再安装示例依赖。集群所有节点需要相同的 Python、Ray、NIXL、PyTorch 环境；UCX/NIXL 后端依赖也必须可用。
 
 ## 单机运行
 
 从仓库根目录执行：
 
 ```bash
-# 2 个 CPU Actor，默认 16 MiB。
+# 每个 Actor 独占 1 张 GPU，默认 16 MiB。
 python examples/ray_nixl/main.py
 
-# 每个 Actor 独占 1 张 GPU，共需 2 张 GPU。
-python examples/ray_nixl/main.py --device cuda --size-mib 64
+python examples/ray_nixl/main.py --size-mib 64
 ```
 
 不指定 `--address` 时，由 Ray 初始化本地运行环境。输出 `verified: true` 表示形状、dtype、设备和全部元素都通过校验。结果包含实际字节数和两端 node ID。
@@ -64,11 +62,8 @@ ray start --head --node-ip-address=<HEAD_IP> --port=6379
 # 节点 B
 ray start --address=<HEAD_IP>:6379 --node-ip-address=<WORKER_IP>
 
-# 在节点 A、仓库根目录提交
+# 在节点 A、仓库根目录提交；两个节点各需至少 1 张可用 GPU。
 python examples/ray_nixl/main.py --address auto --cross-node --size-mib 64
-
-# 两个不同节点各需至少 1 张可用 GPU
-python examples/ray_nixl/main.py --address auto --cross-node --device cuda --size-mib 64
 ```
 
 `--cross-node` 使用硬性节点亲和性，将两个 Actor 放在两个不同节点，并检查返回的 node ID；不足两个合适节点时直接报错。默认等待超时为 120 秒，可用 `--timeout` 调整。示例结束只清理自己的 Actor 和 driver 连接，不停止已有集群。
@@ -79,11 +74,11 @@ python examples/ray_nixl/main.py --address auto --cross-node --device cuda --siz
 - **Tensor 的生命周期。** Producer 必须存活至消费完成；示例保留引用且不修改已发布的 Tensor。RDT 发布不等于创建不可变数据快照，也不提供文件持久化。
 - **NIXL 不等于已启用 RDMA。** 实际路径取决于 NIXL 后端、UCX/libfabric、网卡和配置；单机可能走共享内存或 CUDA IPC，跨机也可能走 TCP。输出的 `transport: nixl` 仅表示代码选择了 NIXL。
 - **验证 RDMA 要看真实通路。** 使用 UCX 后端时，可在启动各节点 Ray 进程之前设置 `UCX_LOG_LEVEL=info`，结合 UCX 日志和网卡计数器检查；`--cross-node` 和传输成功本身都不是 RDMA 证据。不要将 `UCX_TLS` 随意限制为机器未提供的 transport。
-- **CPU 和 GPU 是两条独立示例路径。** 默认 CPU→CPU 更接近分享对话里的 slime 数值字段；`--device cuda` 演示 GPU→GPU，不隐式执行 CPU→GPU 转换。
+- **固定 GPU→GPU。** 不提供 CPU fallback 或自动设备选择；资源和传输结果用 `assert` 校验，请勿使用 `python -O`。
 
 ## 实测记录
 
-2026-11-12，在单节点 NVIDIA H20 服务器运行，Python 3.12、Ray 2.58.0、NIXL 1.5.2、PyTorch 2.11.0+cu128。两个用例均退出码为 0，`verified: true`，形状、dtype、设备及全部元素校验通过，日志确认 NIXL 后端为 UCX。
+2026-11-12，简化前的版本在单节点 NVIDIA H20 服务器运行，Python 3.12、Ray 2.58.0、NIXL 1.5.2、PyTorch 2.11.0+cu128。以下是旧版命令和结果；当前版本已移除 `--device`。两个用例均退出码为 0，`verified: true`，形状、dtype、设备及全部元素校验通过，日志确认 NIXL 后端为 UCX。
 
 | 用例 | 命令参数 | 结果 |
 | --- | --- | --- |
@@ -93,5 +88,7 @@ python examples/ray_nixl/main.py --address auto --cross-node --device cuda --siz
 这是单机正确性测试，没有验证跨节点通信或 RDMA 性能。`fetch_seconds` 包含首次初始化开销，不用作带宽结论。
 
 本次远端测试环境为 `/opt/venvs/ray-nixl-test`，通过 `.pth` 复用 `/opt/venvs/carrot` 中的 Ray/PyTorch，仅额外安装 NIXL；原训练环境未升级。复现时使用该环境的 `bin/python`。原始日志保存在检测得到的 `$MY_DFS/work/mylws/outputs/ray_nixl/2026-11-12/` 下，分别为 `cpu-16mib.log` 和 `cuda-64mib.log`。
+
+2026-11-12，固定 GPU 路径后在同一环境回归 `python examples/ray_nixl/main.py --size-mib 64 --timeout 90`：**PASS**，退出码 0，全部断言通过，NIXL 后端为 UCX。源码 SHA-256 为 `14262257c70513597dc756d07bca7dea0071b48aa9ff88bd626e481446dc4028`；日志为同目录 `cuda-only-64mib.log`。仍未验证跨节点传输。
 
 参考：[Ray RDT 文档](https://docs.ray.io/en/master/core/direct-transport/index.html)、[Ray 2.58.0 NIXL 实现](https://github.com/ray-project/ray/blob/ray-2.58.0/python/ray/experimental/rdt/nixl_tensor_transport.py)。
