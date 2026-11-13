@@ -3,6 +3,7 @@
     "**/.agents": true,
     "**/.codex": true,
     "**/.vscode": true,
+    "**/mylws.code-workspace": true,
     "**/__pycache__": true
   }
 }
