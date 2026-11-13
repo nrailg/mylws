@@ -31,5 +31,6 @@ python -m pip install -r ../TransferQueue/requirements.txt
 PYTHONPATH="$PWD/../TransferQueue:${PYTHONPATH:-}" python examples/tq/tq_as_kv.py
 ```
 
-2026-11-13 本地 macOS 实测 **PASS**，退出码 0；读取的向量为 nested tensor，逐样本校验。
-环境：`.venv`，Ray 2.60.0、PyTorch 2.11.0、TQ 0.1.13.dev0；日志：`.venv/tq_as_kv.log`。
+2026-11-13 H20 服务器实测 **PASS**，退出码 0；本例仍使用 CPU Tensor，未验证 GPU 数据传输。
+环境：`/opt/venvs/tq-test`，Ray 2.58.0、PyTorch 2.11.0+cu128、TQ 0.1.13.dev0。
+日志：`$MY_DFS/work/mylws/outputs/tq/2026-11-13/tq-as-kv-h20.log`。

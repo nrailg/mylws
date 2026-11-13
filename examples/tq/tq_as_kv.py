@@ -11,12 +11,13 @@ def main() -> None:
         keys = ["sample_0", "sample_1"]
         partition = "kv_example"
         input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        labels = torch.tensor([[1, 2, 3], [4, 5, 6]])
 
         # 每个 key 对应 batch 中的一行；返回的 meta 不包含 Tensor 本体。
         meta = tq.kv_batch_put(
             keys=keys,
             partition_id=partition,
-            fields=TensorDict({"input_ids": input_ids}, batch_size=[2]),
+            fields=TensorDict({"input_ids": input_ids, "labels": labels}, batch_size=[2]),
         )
         print("meta:", meta)
         assert meta.keys == keys
