@@ -65,6 +65,14 @@ python examples/ray_nixl/main.py --size-mib 64
 
 ## 实测记录
 
+8 GiB 的 NIXL / 原生 TCP socket 对比见 [测试说明与结果](../../tests/ray_nixl/test_nixl_vs_tcp.md)：
+
+```bash
+python tests/ray_nixl/test_nixl_vs_tcp.py --size-mib 8192 --warmup 2 --repeats 5
+```
+
+两个 Actor 仍共享一张 GPU，TCP 使用 loopback；两端 pinned CPU buffer 和 GPU buffer 均预分配，计时包含 TCP 的 GPU↔CPU 拷贝。该测试不代表跨节点 RDMA 与 TCP 的性能差异。
+
 2026-11-12，简化前的版本在单节点 NVIDIA H20 服务器运行，Python 3.12、Ray 2.58.0、NIXL 1.5.2、PyTorch 2.11.0+cu128。以下是旧版命令和结果；当前版本已移除 `--device`。两个用例均退出码为 0，`verified: true`，形状、dtype、设备及全部元素校验通过，日志确认 NIXL 后端为 UCX。
 
 | 用例 | 命令参数 | 结果 |

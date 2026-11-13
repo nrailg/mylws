@@ -1,5 +1,6 @@
 {
   "files.exclude": {
+    "**/.agents": true,
     "**/.codex": true,
     "**/.vscode": true,
     "**/__pycache__": true
