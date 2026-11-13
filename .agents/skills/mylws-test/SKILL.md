@@ -11,6 +11,8 @@ description: >-
 
 测试代码同样必须非常简洁：直接调用示例并用必要的 `assert` 校验结果和非法情况，不增加生产级异常体系、兼容分支或通用测试封装。能在现有示例里直接断言的行为，不再复制一套实现来测试。
 
+测试也以人类可读性为重要目标：输入、调用、预期结果和断言应清楚可辨；使用明确命名和必要中间变量，不为减少行数把多个验证意图挤进复杂表达式。
+
 GPU 示例的测试环境默认有 GPU。直接运行 CUDA 路径，保留必要的 GPU 数量和设备断言；不为本地无 GPU 增加 CPU fallback、自动设备选择或跳过失败的分支。实际环境不满足要求时报告阻塞，不降级运行。
 
 ## 上机前检查
@@ -77,12 +79,9 @@ tests/ray_nixl/test_transfer.md
 
 ```bash
 python examples/ray_nixl/main.py --size-mib 64
-
-# 仅在两个合适节点已加入同一个 Ray 集群后执行
-python examples/ray_nixl/main.py --address auto --cross-node --size-mib 64
 ```
 
-- 用例需两个 Actor 的 CPU 资源和两张可用 GPU。只有一个节点时，将跨节点传输标为 `NOT RUN`，可独立验证 `--cross-node` 的拒绝行为。
+- 用例需同一节点上 2 CPU 和 1 GPU，两个 Actor 共享该 GPU。检查两端 node ID 和 Ray GPU ID 相同；仅比较进程内的 `cuda:0` 不足以证明同卡。当前示例不提供跨节点模式。
 - 同时检查退出码、shape、dtype、设备和数据内容，以及日志中的实际 NIXL 后端；输出中的固定 `transport` 字段不能独立证明底层通信路径。
 - NIXL/UCX 初始化成功、跨节点成功均不等于已证明 RDMA；需要实际 transport 日志和相应设备证据。没有证据就写“未验证”，不把 TCP、共享内存或 CUDA IPC 结果表述成 RDMA。
 - 正确性和性能分开报告。包含首次连接、内存注册或冷启动的计时不能作为稳定带宽；只有性能任务才增加预热、重复采样与对应统计。
