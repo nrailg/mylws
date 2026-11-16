@@ -13,3 +13,4 @@ node_modules/
 .env.*
 !.env.example
 /mylws.code-workspace
+/outputs/cute/
