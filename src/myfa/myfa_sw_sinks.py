@@ -1,3 +1,5 @@
+# pyright: reportInvalidTypeForm=false
+
 import math
 
 import tilelang as tl
@@ -7,7 +9,6 @@ import torch
 # ---------------------------------------------------------------------------
 # TileLang kernels  (BSHD layout: Q/K/V/O are [B, S, H, D])
 # ---------------------------------------------------------------------------
-
 
 @tl.jit(
     out_idx=[-2, -1],

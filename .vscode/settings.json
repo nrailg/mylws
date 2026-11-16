@@ -1,6 +1,5 @@
 {
   "files.exclude": {
-    "**/.agents": true,
     "**/.codex": true,
     "**/.vscode": true,
     "**/mylws.code-workspace": true,

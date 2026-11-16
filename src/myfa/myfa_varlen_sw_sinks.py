@@ -1,3 +1,5 @@
+# pyright: reportInvalidTypeForm=false
+
 import math
 from functools import lru_cache
 
