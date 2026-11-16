@@ -25,6 +25,17 @@ python examples/mooncake/transfer.py
 
 `store.py` 的 shape/dtype 由调用方掌握；`transfer.py` 的 Pipe 只传地址和完成信号。
 
-两个 Python 示例均输出 `PASS` 即成功。[测试记录](../../tests/mooncake/quickstart.md)。
+两个 Python 示例均输出 `PASS` 即成功。
+
+## 验证结果
+
+2026-11-13 在 Linux H20 节点通过，环境为 Python 3.12、PyTorch 2.11.0、Mooncake 0.3.14，
+使用独立 `/opt/venvs/tq-test` 环境运行上述命令。
+
+- Store：GPU Tensor → CPU 存储池 → GPU Tensor，RDMA put/get、内容校验及删除通过。
+- Transfer Engine：两个进程共享 GPU 0，通过 RDMA 写入 GPU Tensor，接收端内容校验通过。
+- 日志确认 RDMA transport、握手及 `device='cuda:0'`。仅验证单机同步传输，未测跨节点、异步或性能；部分网卡探测及内存注销告警未影响校验。
+
+日志：`$MY_DFS/work/mylws/outputs/mooncake/2026-11-13/gpu-rdma.log`。
 
 参考：[Store API](https://github.com/kvcache-ai/Mooncake/blob/main/docs/source/api-reference/python/mooncake-store.md)、[Transfer Engine](https://github.com/kvcache-ai/Mooncake/blob/main/docs/source/design/transfer-engine/index.md)。
