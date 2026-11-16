@@ -7,7 +7,7 @@ description: >-
 
 # mylws 代码审查
 
-开发和审查共用以下规则。开发前阅读 Style 和 Coding（Design），将相关规则用于实现和自查，无须启动完整审查流程。用户请求 review 或提交前自查时，按 [审查流程](#审查流程) 确认范围，检查两部分并合并重复 findings；指定单类时仅检查对应部分。
+开发和审查共用以下规则。开发前阅读 Style 和 Coding（Design），将相关规则用于实现和自查；是否启动独立 review 由 [mylws-develop](../mylws-develop/SKILL.md) 分流决定。用户请求 review、提交前审查或开发流程进入 Code Review 时，按 [审查流程](#审查流程) 确认范围，检查两部分并合并重复 findings；指定单类时仅检查对应部分。本 skill 不自行启动 agent 或循环。
 
 审查覆盖请求范围内的 `src/`、`examples/`、`tests/` 和配套说明。先理解实现需求或示例的学习目标、接口和调用路径，不以风格扫描代替正确性与设计判断。
 
@@ -114,7 +114,7 @@ tests/<主题>/       独立测试代码
 
 ## 审查流程
 
-供 Style 和 Coding（Design）共用；普通开发只应用规则，不执行本流程。
+供 Style 和 Coding（Design）共用；开发中的独立 Code Review 同样使用本流程，小改动自查只应用相关规则。
 
 ### 范围与证据
 
