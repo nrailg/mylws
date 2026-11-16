@@ -7,17 +7,19 @@ from mooncake.engine import TransferEngine
 
 
 def receive(connection: Connection) -> None:
+    torch.cuda.set_device(0)
     engine = TransferEngine()
-    assert engine.initialize("127.0.0.1", "P2PHANDSHAKE", "tcp", "") == 0
-    tensor = torch.full((8,), -1.0)
+    assert engine.initialize("127.0.0.1", "P2PHANDSHAKE", "rdma", "") == 0
+    tensor = torch.full((8,), -1.0, device="cuda:0")
     ptr, size = tensor.data_ptr(), tensor.numel() * tensor.element_size()
     assert engine.register_memory(ptr, size) == 0
     try:
+        torch.cuda.synchronize()  # 初始化完成后才能让发送端写入。
         # Pipe 只交换地址和完成信号，Tensor 通过 Transfer Engine 传输。
         connection.send((f"127.0.0.1:{engine.get_rpc_port()}", ptr, size))
         assert connection.poll(30), "sender timed out"
         assert connection.recv() == "done"
-        assert torch.equal(tensor, torch.arange(8, dtype=torch.float32))
+        assert torch.equal(tensor, torch.arange(8, dtype=torch.float32, device="cuda:0"))
         print("Transfer receive:", tensor, flush=True)
     finally:
         engine.unregister_memory(ptr)
@@ -25,9 +27,10 @@ def receive(connection: Connection) -> None:
 
 
 def main() -> None:
-    # 显式关闭 transport 自动选择；spawn 子进程继承环境变量。
-    os.environ["MC_FORCE_TCP"] = "1"
-    os.environ["MC_TCP_BIND_ADDRESS"] = "127.0.0.1"
+    torch.cuda.set_device(0)
+    # 强制使用 RDMA；spawn 子进程继承环境变量。
+    assert "MC_FORCE_TCP" not in os.environ, "unset MC_FORCE_TCP to use RDMA"
+    os.environ["MC_FORCE_HCA"] = "1"
     context = mp.get_context("spawn")
     parent, child = context.Pipe()
     receiver = context.Process(target=receive, args=(child,))
@@ -37,12 +40,13 @@ def main() -> None:
         assert parent.poll(30), "receiver timed out"
         endpoint, remote_ptr, size = parent.recv()
         engine = TransferEngine()
-        assert engine.initialize("127.0.0.1", "P2PHANDSHAKE", "tcp", "") == 0
-        tensor = torch.arange(8, dtype=torch.float32)
+        assert engine.initialize("127.0.0.1", "P2PHANDSHAKE", "rdma", "") == 0
+        tensor = torch.arange(8, dtype=torch.float32, device="cuda:0")
         assert tensor.numel() * tensor.element_size() == size
         ptr = tensor.data_ptr()
         assert engine.register_memory(ptr, size) == 0
         try:
+            torch.cuda.synchronize()  # GPU 写完源数据后才能提交 RDMA。
             assert engine.transfer_sync_write(endpoint, ptr, remote_ptr, size) == 0
             parent.send("done")
         finally:

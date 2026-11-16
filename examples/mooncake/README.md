@@ -6,8 +6,9 @@
 - **Store 客户端**：贡献存储内存，按 key 执行 put/get/remove；内部使用 Transfer Engine。
 - **Transfer Engine**：按远端地址读写内存，可独立使用，无需 Store Master。
 
-本例固定单机 CPU Tensor + TCP，用 P2PHANDSHAKE 交换连接信息；不依赖 Ray/TQ，不验证 GPU/RDMA。
-Linux、已有 PyTorch 的环境，在仓库根目录执行：
+两个示例均使用单机 GPU Tensor + RDMA，需要支持 GPUDirect RDMA 的环境。
+固定使用 `cuda:0`，Transfer Engine 两个进程共享该 GPU；Store 存储池仍是 CPU 内存，关闭 memcpy 捷径。
+使用 P2PHANDSHAKE 交换连接信息。在 Linux、已有 PyTorch 的环境，从仓库根目录执行：
 
 ```bash
 python -m pip install -r examples/mooncake/requirements.txt
