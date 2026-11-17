@@ -4,7 +4,7 @@ CuTe 用 `Layout` 描述坐标到 offset 的映射，再用 `Tensor` 将映射�
 这组例子从手写索引开始，逐步走到 tile 和 thread partition；每个 `.cpp` 都有独立的 `main()`。
 
 - 所有程序在 **host CPU** 上执行，不启动 CUDA kernel，也不需要 GPU。
-- 编译仍需要 CUTLASS 和 CUDA Toolkit headers；这组依赖按 CUTLASS **v3.9.2** 固定。
+- 编译仍需要 CUTLASS 和 CUDA Toolkit headers；这组依赖按 CUTLASS **v4.8.1** 固定。
 - 每课先手算输出，再运行核对；断言通过时打印 `tXX PASS`。不要加 `-DNDEBUG`。
 
 ## 编译运行
@@ -12,24 +12,31 @@ CuTe 用 `Layout` 描述坐标到 offset 的映射，再用 `Tensor` 将映射�
 建议在已有 CUDA Toolkit 的 Linux 开发环境运行，需要 C++17 compiler 和 Make。
 CuTe 是 header-only，这些例子无需编译 CUTLASS 库或链接 CUDA runtime。
 
-首次准备依赖（也可以将 `CUTLASS_DIR` 指向已有的对应版本源码）：
+Gemini 上统一使用 `$MY_DFS/work/deps/cutlass-v4.8.1`。
+当前测试服务器已准备好依赖，无需重新 clone；确认当前会话的 `MY_DFS` 后设置：
 
 ```bash
-mkdir -p "$HOME/.cache/mylws"
-git clone --depth 1 --branch v3.9.2 https://github.com/NVIDIA/cutlass.git \
-  "$HOME/.cache/mylws/cutlass-v3.9.2"
-export CUTLASS_DIR="$HOME/.cache/mylws/cutlass-v3.9.2"
+export CUTLASS_DIR="${MY_DFS:?set MY_DFS from the current Gemini session}/work/deps/cutlass-v4.8.1"
 export CUDA_HOME=/usr/local/cuda  # 改成实际 Toolkit 路径
 ```
 
-在 mylws 根目录编译并运行全部例子：
+仅在依赖目录尚不存在的新环境中，先准备依赖：
 
 ```bash
-make -C examples/cute check
+mkdir -p "$(dirname "$CUTLASS_DIR")"
+git clone --depth 1 --branch v4.8.1 https://github.com/NVIDIA/cutlass.git "$CUTLASS_DIR"
+```
+
+在 mylws 根目录强制编译并运行全部例子：
+
+```bash
+cd "$MY_DFS/work/mylws"
+make -B -C examples/cute check
 ```
 
 产物默认放在 `outputs/cute/build/`，该目录不参与项目代码同步，避免 Mac/Linux 二进制互相覆盖。
 需要独立构建目录时传入 `BUILD_DIR=/absolute/path`。
+更换 `CUTLASS_DIR` 后使用 `make -B -C examples/cute check`，强制重新编译。
 
 只学习第一课：
 
@@ -48,21 +55,14 @@ c++ -std=c++17 -I"$CUTLASS_DIR/include" -I"$CUDA_HOME/include" \
 
 ## 验证结果
 
-2026-11-16 在 Gemini launcher 上使用默认编译选项，7 个例子全部重新编译并运行通过，
+2026-11-17 在 Gemini launcher 上使用默认编译选项，7 个例子全部重新编译并运行通过，
 输出 `t01 PASS` 至 `t07 PASS`，退出码 0。环境：Ubuntu 22.04.5 x86_64、GCC 12.3、
-CUDA Toolkit 12.8、CUTLASS v3.9.2。
+CUDA Toolkit 12.8、CUTLASS v4.8.1。
 
-该环境已同步依赖，确认当前会话的 `MY_DFS` 后可复现：
-
-```bash
-export CUTLASS_DIR="${MY_DFS:?set MY_DFS from the current Gemini session}/work/deps/cutlass-v3.9.2"
-export CUDA_HOME=/usr/local/cuda
-cd "$MY_DFS/work/mylws"
-make -B -C examples/cute check
-```
+复现使用上面的「编译运行」命令。
 
 验证覆盖索引、view 共享数据、tile 坐标和 thread partition 的完整覆盖与 copy 结果；
-没有启动 GPU kernel。日志：`$MY_DFS/work/mylws/outputs/cute/2026-11-16-linux/host-check.log`。
+没有启动 GPU kernel。日志：`$MY_DFS/work/mylws/outputs/cute/2026-11-17-cutlass-4.8.1/host-check.log`。
 
 ## 按顺序学习
 
@@ -156,4 +156,4 @@ thread layout 将线程坐标映射成 thread ID；这两个 layout 的作用不
 
 参考：[CuTe Layout](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/01_layout.html)、
 [Tensor](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/03_tensor.html)、
-[官方 C++ 示例](https://github.com/NVIDIA/cutlass/tree/v3.9.2/examples/cute/tutorial)。
+[官方 C++ 示例](https://github.com/NVIDIA/cutlass/tree/v4.8.1/examples/cute/tutorial)。

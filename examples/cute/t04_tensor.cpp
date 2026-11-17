@@ -24,7 +24,7 @@ int main() {
         std::printf("\n");
     }
 
-    // 交换 shape 和 stride 得到 transpose view，没有搬运数据。
+    // 分别对调 shape 和 stride 中的两个 mode，得到共享 storage 的 transpose view。
     auto transposed = make_tensor(&storage[0], make_layout(make_shape(4, 3), make_stride(1, 4)));
     for (int row = 0; row < 3; ++row) {
         for (int col = 0; col < 4; ++col) {

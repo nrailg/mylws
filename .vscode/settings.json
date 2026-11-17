@@ -4,5 +4,20 @@
     "**/.vscode": true,
     "**/mylws.code-workspace": true,
     "**/__pycache__": true
+  },
+  "[cpp]": {
+    "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd",
+    "editor.insertSpaces": true,
+    "editor.tabSize": 4,
+    "editor.detectIndentation": false,
+    "editor.inlayHints.enabled": "off",
+    "editor.inlineSuggest.enabled": false,
+    "editor.quickSuggestions": {
+      "other": "on",
+      "comments": "off",
+      "strings": "off"
+    },
+    "editor.suggestOnTriggerCharacters": true,
+    "editor.parameterHints.enabled": true
   }
 }

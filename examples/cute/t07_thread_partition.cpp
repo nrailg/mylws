@@ -21,6 +21,7 @@ int main() {
                                      make_stride(Int<4>{}, Int<1>{}));
     for (int tid = 0; tid < size(thread_layout); ++tid) {
         // 在 host 上枚举 thread ID，展示分工；这里没有启动 CUDA 线程。
+        // 每个线程每隔 2 行、4 列取一个元素，得到 shape 为 (2, 2) 的 view。
         auto thread_input = local_partition(input, thread_layout, tid);
         auto thread_output = local_partition(output, thread_layout, tid);
         assert(size<0>(thread_input) == 2);
