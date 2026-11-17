@@ -27,14 +27,15 @@ mkdir -p "$(dirname "$CUTLASS_DIR")"
 git clone --depth 1 --branch v4.8.1 https://github.com/NVIDIA/cutlass.git "$CUTLASS_DIR"
 ```
 
-在 mylws 根目录强制编译并运行全部例子：
+在 mylws 根目录增量编译并运行全部例子：
 
 ```bash
 cd "$MY_DFS/work/mylws"
-make -B -C examples/cute check
+make -C examples/cute check
 ```
 
 产物默认放在 `outputs/cute/build/`，该目录不参与项目代码同步，避免 Mac/Linux 二进制互相覆盖。
+未改动的 `.cpp` 会跳过编译；`check` 每次仍会运行全部例子。只编译时使用 `make -C examples/cute`。
 需要独立构建目录时传入 `BUILD_DIR=/absolute/path`。
 更换 `CUTLASS_DIR` 后使用 `make -B -C examples/cute check`，强制重新编译。
 
@@ -55,17 +56,16 @@ c++ -std=c++17 -I"$CUTLASS_DIR/include" -I"$CUDA_HOME/include" \
 
 ## 验证结果
 
-t08 已加入断言和公式渲染检查，尚未上机编译运行；此前 t03/t06 的 shape 调整也待重新验证。
-下面是这些改动之前的运行记录。
-
-2026-11-17 在 Gemini launcher 上使用默认编译选项，7 个例子全部重新编译并运行通过，
-输出 `t01 PASS` 至 `t07 PASS`，退出码 0。环境：Ubuntu 22.04.5 x86_64、GCC 12.3、
+2026-11-17 在 Gemini launcher 上使用默认编译选项，9 个例子全部强制重新编译并运行通过。
+随后将 t09 改为直接使用 tuple target 的返回值，又单独重编译运行通过：
+`target offsets: 72; extra offsets: 36`、`t09 PASS`，退出码 0。
+环境：Ubuntu 22.04.5 x86_64、GCC 12.3、
 CUDA Toolkit 12.8、CUTLASS v4.8.1。
 
 复现使用上面的「编译运行」命令。
 
-验证覆盖索引、view 共享数据、tile 坐标和 thread partition 的完整覆盖与 copy 结果；
-没有启动 GPU kernel。日志：`$MY_DFS/work/mylws/outputs/cute/2026-11-17-cutlass-4.8.1/host-check.log`。
+验证覆盖索引、view 共享数据、tile/线程分工、layout algebra，以及 complement 的 tuple/size 参数差异。
+没有启动 GPU kernel。最新 t09 日志：`$MY_DFS/work/mylws/outputs/cute/2026-11-17-complement-fix/tuple-target-check.log`。
 
 ## 按顺序学习
 
@@ -174,9 +174,40 @@ make -C examples/cute ../../outputs/cute/build/t08_layout_algebra
 outputs/cute/build/t08_layout_algebra
 ```
 
+**9. [t09_complement_divide.cpp](t09_complement_divide.cpp)：complement 与 logical_divide**
+
+先固定目标逻辑坐标 `0..5`，比较两种分组；所有参数均为 static：
+
+| tile layout B | complement(B, 6) | 三个 tile 各自覆盖的逻辑坐标 |
+| --- | --- | --- |
+| `2:1` | `3:2` | `{0,1}`、`{2,3}`、`{4,5}` |
+| `2:3` | `3:1` | `{0,3}`、`{1,4}`、`{2,5}` |
+
+complement 描述补齐覆盖所需的位移，不是简单的集合差。
+`make_layout(B, complement(B, 6))` 构造 `(tile 内坐标, tile 坐标)` 到逻辑坐标的映射。
+
+中间的二维输入例子直接调用 `complement(B, target_shape)`，其中 `B=(2,3):(3,1)`、
+target shape 为 `(8,9)`。CUTLASS v4.8.1 内部 `ceil_div((8,9),6)` 得到 `(2,9)`，
+返回 `18:6`；程序使用这个结果构造 `((2,3),18):((3,1),6)`，遍历全部 18 个 tile。
+验证 `0..107` 恰好覆盖一次，其中目标范围 `0..71` 有 72 个位置，额外范围 `72..107` 有 36 个位置，
+输出以 `(extra)` 标注。只计算 offset，不访问实际 buffer。
+
+这不等于在 8×9 矩阵上切 2×3 的矩形子块；tuple 的逐项向上取整可能带来额外覆盖。
+传 `size(target_shape)` 得到 `12:6` 是另一种调用，本例不以它替换 tuple target。
+
+再接上原数据 layout `A=6:2`：`logical_divide(A,B)` 等价于将上述组合与 A 做 composition。
+对于 `B=2:3`，结果是 `(2,3):(6,2)`；例如 `(i,t)=(1,2)` 先映射到逻辑坐标 `5`，
+再得到 offset `10`。程序验证两种分组都恰好覆盖 `0..5`，并对照手动组合与 `logical_divide`。
+本课没有复制数据；二维 target 示例明确检查额外覆盖，其余两个一维示例恰好覆盖目标范围。
+
+```bash
+make -C examples/cute ../../outputs/cute/build/t09_complement_divide
+outputs/cute/build/t09_complement_divide
+```
+
 ## 后续衔接
 
-接下来补 complement、layout product/divide 与 thread-value mapping，再进入真实 GPU GEMM、
+接下来将 divide 推广到二维，比较 logical/zipped/tiled/flat divide，再补 layout product 与 thread-value mapping，进入真实 GPU GEMM、
 Tensor Core MMA 和异步 pipeline。当前 host 示例还不足以覆盖 DeepGEMM 的执行机制。
 
 参考：[CuTe Layout](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/01_layout.html)、
