@@ -89,16 +89,17 @@ dynamic 类型不意味着编译器一定无法优化常量，两者区别在于
 
 **3. [t03_hierarchical_layout.cpp](t03_hierarchical_layout.cpp)：嵌套的 shape / stride**
 
-shape `((2,3),4)` 把 6 行分成 `(inner, outer)`，保留 4 列。
-配上 stride `((4,8),1)`，坐标 `((inner,outer),col)` 的 offset 为：
+shape `(2,(2,3),4)` 表示两个 batch，每个有 6 行 4 列，行分成 `(inner, outer)`。
+配上 stride `(24,(4,8),1)`，坐标 `(batch,(inner,outer),col)` 的 offset 为：
 
 ```text
 row    = inner + 2 * outer
-offset = inner * 4 + outer * 8 + col = row * 4 + col
+offset = batch * 24 + inner * 4 + outer * 8 + col = (batch * 6 + row) * 4 + col
 ```
 
-顶层仍然只有两个 mode，所以 `rank = 2`；嵌套使 `depth = 2`；总元素数是 `2*3*4 = 24`。
-这里第一组坐标中 `inner` 变化最快。先算 `((1,2),3)`，应得到 `23`。
+顶层有 batch、行、列三个 mode，所以 `rank = 3`；tuple 嵌套两层，所以 `depth = 2`。
+总元素数是 `2*2*3*4 = 48`。行坐标中 `inner` 变化最快。
+先算 `(1,(1,2),3)`，应得到 `47`。程序会打印 rank 和 depth，便于对照。
 
 **4. [t04_tensor.cpp](t04_tensor.cpp)：给 Layout 接上数据**
 
@@ -120,16 +121,16 @@ row view 的 stride 是 `1`，column view 的 stride 是 `4`，两者继续共�
 
 **6. [t06_local_tile.cpp](t06_local_tile.cpp)：用 tile 坐标选一个子块**
 
-将 `4×8` 矩阵分成四个 `2×4` tile。
-`local_tile(matrix, tile_shape, make_coord(1,1))` 返回右下角 tile，起点是原矩阵的 `(2,4)`：
+将 `4×12` 矩阵分成六个 `2×4` tile，tile grid 为 `(4/2, 12/4) = (2,3)`。
+`local_tile(matrix, tile_shape, make_coord(1,1))` 返回下排中间的 tile，起点是原矩阵的 `(2,4)`：
 
 ```text
-20 21 22 23
 28 29 30 31
+40 41 42 43
 ```
 
 tile 内坐标 `(row,col)` 对应原坐标 `(tile_row*2+row, tile_col*4+col)`。
-tile view 的行 stride 仍然是 `8`，不会自动压紧成 `4`，也没有搬进 shared memory。
+tile view 的行 stride 仍然是 `12`，不会自动压紧成 `4`，也没有搬进 shared memory。
 本课 shape 恰好整除；`local_tile` 不替你检查越界或生成边界 mask。
 
 **7. [t07_thread_partition.cpp](t07_thread_partition.cpp)：给线程分配元素**

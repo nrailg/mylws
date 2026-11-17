@@ -13,6 +13,25 @@ description: >-
 
 编码前阅读 [mylws-code-review](../mylws-code-review/SKILL.md) 的首要原则、Style 和 Coding（Design），开发和审查共用该处规则。验证执行使用 [mylws-test](../mylws-test/SKILL.md)。纯 review 或运行已有测试直接使用对应 skill，不启动开发流程。
 
+## 学习示例的参数与注释
+
+- 展示不同维度或概念时，优先使用不同的数值（如 tile grid `(2, 3)`），避免相同数值掩盖区别。可保留直观的固定循环边界，在附近注释中给出推导。
+- 多行推导或结构化说明使用 VS Code In Comment Preview 对应语言的 Markdown 标记，正文可含标题、列表和 `$...$` 公式。C++ 使用 `/* md`，正文各行以 `*` 开头，以 `*/` 结束；Python 使用 `''' md` 开头、`'''` 结束。源码中不额外包裹 Markdown fenced block。
+
+```cpp
+/* md
+ * # Tile 数量
+ * 行方向：$4 / 2 = 2$；列方向：$12 / 4 = 3$。
+ */
+```
+
+```python
+''' md
+# Tile 数量
+行方向：$4 / 2 = 2$；列方向：$12 / 4 = 3$。
+'''
+```
+
 ## 任务分流
 
 先区分探索性工作与常规开发。新算法、新优化、新架构、CUDA kernel 和 Torch operator 开发属于探索性工作，必须先走下面的调研与确认流程；其余常规开发直接推进。

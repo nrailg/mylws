@@ -13,8 +13,8 @@ int main() {
     auto matrix = make_tensor(&storage[0], make_layout(make_shape(3, 4), make_stride(4, 1)));
 
     // _ 保留该 mode；整数固定坐标并去掉该 mode。
-    auto row_view = matrix(1, _);
-    auto column_view = matrix(_, 2);
+    auto row_view = matrix(1, cute::_);
+    auto column_view = matrix(cute::_, 2);
     assert(size(row_view) == 4);
     assert(size(column_view) == 3);
     assert(stride<0>(row_view) == 1);
