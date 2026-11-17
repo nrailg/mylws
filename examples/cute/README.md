@@ -1,7 +1,7 @@
 # CuTe C++ 入门
 
 CuTe 用 `Layout` 描述坐标到 offset 的映射，再用 `Tensor` 将映射应用到数据。
-这组例子从手写索引开始，逐步走到 tile 和 thread partition；每个 `.cpp` 都有独立的 `main()`。
+这组例子从手写索引开始，逐步走到 tile、thread partition 和 layout algebra；每个 `.cpp` 都有独立的 `main()`。
 
 - 所有程序在 **host CPU** 上执行，不启动 CUDA kernel，也不需要 GPU。
 - 编译仍需要 CUTLASS 和 CUDA Toolkit headers；这组依赖按 CUTLASS **v4.8.1** 固定。
@@ -54,6 +54,9 @@ c++ -std=c++17 -I"$CUTLASS_DIR/include" -I"$CUDA_HOME/include" \
 ```
 
 ## 验证结果
+
+t08 已加入断言和公式渲染检查，尚未上机编译运行；此前 t03/t06 的 shape 调整也待重新验证。
+下面是这些改动之前的运行记录。
 
 2026-11-17 在 Gemini launcher 上使用默认编译选项，7 个例子全部重新编译并运行通过，
 输出 `t01 PASS` 至 `t07 PASS`，退出码 0。环境：Ubuntu 22.04.5 x86_64、GCC 12.3、
@@ -150,11 +153,33 @@ thread layout 将线程坐标映射成 thread ID；这两个 layout 的作用不
 最后逐个核对输出与输入相同，并检查每个位置恰好被访问一次。
 这里没有验证真实线程并发、同步或访存性能。
 
+**8. [t08_layout_algebra.cpp](t08_layout_algebra.cpp)：coalesce 与 composition**
+
+先区分一维逻辑坐标与 offset：shape 为 `(m,n)` 时，整数 `k` 对应 `(k % m, k / m)`，
+再根据 stride 算 offset。这个展开顺序与 row-major/column-major 的 stride 无关。
+
+- `coalesce(A)` 简化 layout，保证 `size` 不变且每个合法整数 `k` 的映射不变。
+  本课 `(2,3):(1,2)` 可合并为 `6:1`；`(2,3):(3,1)` 不能合并成一个 mode，
+  因为它按 `k=0..5` 访问的 offset 是 `0,3,1,4,2,5`。使用 static 参数展示编译期合并。
+- `composition(A,B)` 构造 `R(c)=A(B(c))`。本课 `A=(3,4):(4,1)`、`B=(3,2):(1,6)`，
+  得到 `R=(3,2):(4,2)`，选中 A 的第 0、2 列。B 的输出是 A 的一维逻辑坐标。
+
+先手算 `B(1,1)=7`，再算 `A(7)=A(1,2)=6`；不能把 `A(7)` 当成 offset 7。
+两种操作都只构造映射，不复制数据；`coalesce` 也不保证任意 layout 都能降成 rank 1。
+
+在已配置 CUTLASS/CUDA headers 的 Linux 环境运行：
+
+```bash
+make -C examples/cute ../../outputs/cute/build/t08_layout_algebra
+outputs/cute/build/t08_layout_algebra
+```
+
 ## 后续衔接
 
-能手算第 7 课的分工后，再把这种 partition 放进 CUDA copy kernel，用 `threadIdx.x` 提供 `tid`。
-接下来学习 reduction 和基础 GEMM，然后才需要 `TiledCopy`、`TiledMMA` 与异步 pipeline。
+接下来补 complement、layout product/divide 与 thread-value mapping，再进入真实 GPU GEMM、
+Tensor Core MMA 和异步 pipeline。当前 host 示例还不足以覆盖 DeepGEMM 的执行机制。
 
 参考：[CuTe Layout](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/01_layout.html)、
+[Layout Algebra](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/02_layout_algebra.html)、
 [Tensor](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/03_tensor.html)、
 [官方 C++ 示例](https://github.com/NVIDIA/cutlass/tree/v4.8.1/examples/cute/tutorial)。
