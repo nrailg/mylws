@@ -38,18 +38,34 @@ int main() {
         assert(merged(k) == column_major(k));
     }
 
-    // 同样的 shape，改成 row-major 后不能合成一个 mode：2 * 3 != 1。
+    /* md
+     * **不能合并时，调用 coalesce 会怎样？**
+     *
+     * `row_major = (2,3):(3,1)` 不满足相邻 mode 的合并条件：`2 * 3 != 1`。
+     * `coalesce(row_major)` 正常返回，仍为 `(2,3):(3,1)`，rank 仍为 2；不会报错。
+     * 输入 k 为 `0..5` 时，调用前后的 offset 都是 `0,3,1,4,2,5`。
+     * 这个序列无法用一个固定 stride 表示，所以需要保留两个 mode。
+     *
+     * 更复杂的 layout 可以只合并其中满足条件的部分；coalesce 不保证结果 rank 为 1。
+     */
     auto row_major = make_layout(make_shape(Int<2>{}, Int<3>{}),
                                  make_stride(Int<3>{}, Int<1>{}));
     auto unmerged = coalesce(row_major);
     assert(rank(unmerged) == 2);
-    std::printf("row-major scalar coordinates (k -> offset):\n");
+    assert(shape(unmerged) == shape(row_major));
+    assert(stride(unmerged) == stride(row_major));
+    std::printf("coalesce (cannot merge): ");
+    print(row_major);
+    std::printf(" -> ");
+    print(unmerged);
+    std::printf("\nrank: %d -> %d\n", int(rank(row_major)), int(rank(unmerged)));
+    std::printf("k | before | after\n");
     for (int k = 0; k < 6; ++k) {
         int row = k % 2;
         int col = k / 2;
         assert(row_major(k) == row * 3 + col);
         assert(unmerged(k) == row_major(k));
-        std::printf("%d -> %d  ", k, int(row_major(k)));
+        std::printf("%d | %6d | %5d\n", k, int(row_major(k)), int(unmerged(k)));
     }
     std::printf("\n");
 

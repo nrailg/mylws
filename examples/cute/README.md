@@ -59,6 +59,7 @@ c++ -std=c++17 -I"$CUTLASS_DIR/include" -I"$CUDA_HOME/include" \
 2026-11-17 在 Gemini launcher 上使用默认编译选项，9 个例子全部强制重新编译并运行通过。
 随后将 t09 改为直接使用 tuple target 的返回值，又单独重编译运行通过：
 `target offsets: 72; extra offsets: 36`、`t09 PASS`，退出码 0。
+补充 t08 的不可合并案例后，单独重编译运行也通过：rank 保持 2，全部 offset 不变，`t08 PASS`。
 环境：Ubuntu 22.04.5 x86_64、GCC 12.3、
 CUDA Toolkit 12.8、CUTLASS v4.8.1。
 
@@ -66,6 +67,7 @@ CUDA Toolkit 12.8、CUTLASS v4.8.1。
 
 验证覆盖索引、view 共享数据、tile/线程分工、layout algebra，以及 complement 的 tuple/size 参数差异。
 没有启动 GPU kernel。最新 t09 日志：`$MY_DFS/work/mylws/outputs/cute/2026-11-17-complement-fix/tuple-target-check.log`。
+t08 不可合并案例日志：`$MY_DFS/work/mylws/outputs/cute/2026-11-17-coalesce-check/host-check.log`。
 
 ## 按顺序学习
 
@@ -161,6 +163,7 @@ thread layout 将线程坐标映射成 thread ID；这两个 layout 的作用不
 - `coalesce(A)` 简化 layout，保证 `size` 不变且每个合法整数 `k` 的映射不变。
   本课 `(2,3):(1,2)` 可合并为 `6:1`；`(2,3):(3,1)` 不能合并成一个 mode，
   因为它按 `k=0..5` 访问的 offset 是 `0,3,1,4,2,5`。使用 static 参数展示编译期合并。
+  不可合并时正常返回，本例 shape/stride 保持不变、rank 仍为 2；程序打印调用前后结果并逐项断言。
 - `composition(A,B)` 构造 `R(c)=A(B(c))`。本课 `A=(3,4):(4,1)`、`B=(3,2):(1,6)`，
   得到 `R=(3,2):(4,2)`，选中 A 的第 0、2 列。B 的输出是 A 的一维逻辑坐标。
 
