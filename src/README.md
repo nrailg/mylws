@@ -26,9 +26,9 @@ PYTHONPATH=src python -m pytest src/myfa/test_myfa_sw_sinks.py src/myfa/test_myf
 
 ## my_fp8_quant
 
-`my_fp8_quant(x, group_size=128, round_scale=False)` 沿最后一维分组，将有限的 CUDA BF16/FP32 输入转成 E4M3FN。支持任意前导维度和非连续输入，最后一维须能被 `group_size`（64 或 128）整除。
+用 `y, scales = my_fp8_quant(x, round_scale=False)` 对有限的 CUDA BF16/FP32 输入按 128×128 分块量化。输入形状为 `[..., M, N]`，支持非连续输入，每个前导索引上的矩阵独立分块。边界块仅统计有效元素。
 
-返回的 `(y, scales)` 中，`y` 与输入同形状，`scales` 的最后一维是组数。每组的 FP32 scale 为 `max(absmax, 1e-4) / 448`，启用 `round_scale` 后向上取到最近的 2 的幂。反量化时将每组 FP8 数据转为 FP32 并乘以对应的 scale。
+`y` 与输入同形状，dtype 为 E4M3FN。`scales` 是形状为 `[..., ceil(M/128), ceil(N/128)]` 的 FP32 tensor。例如，256×384 的矩阵返回 2×3 个 scale。每块的 scale 为 `max(absmax, 1e-4) / 448`，启用 `round_scale` 后向上取到最近的 2 的幂。反量化时将每个 FP8 元素转为 FP32 并乘以所属块的 scale。
 
 依赖 PyTorch、TileLang 和 CUDA GPU。测试额外使用 pytest 和 DeepSeek TileKernels，在仓库根目录运行：
 
@@ -36,6 +36,6 @@ PYTHONPATH=src python -m pytest src/myfa/test_myfa_sw_sinks.py src/myfa/test_myf
 PYTHONPATH=src python -m pytest -q src/my_fp8_quant/test_my_fp8_quant.py
 ```
 
-2026-11-18 在单张 NVIDIA H20 上通过全部 14 项测试，使用 PyTorch 2.11.0+cu128、TileLang 0.1.9、apache-tvm-ffi 0.1.9 和 TileKernels `a9dcaf0`。测试逐字节比较 FP8 输出；与 TileKernels 对比时，普通 scale 允许相差 1 ULP，2 的幂 scale 要求完全一致。
+2026-11-18 在单张 H20 上通过 10 项测试。PyTorch reference 覆盖 batch、非连续输入和边界块，DeepSeek TileKernels 的 `per_block_cast` 用于核对 FP8 编码和两种 scale 模式。验证环境为 PyTorch 2.11.0+cu128、TileLang 0.1.9 和 TileKernels `a9dcaf0`。
 
-GPU 测试日志位于 `$MY_DFS/work/mylws/outputs/my_fp8_quant/20261118/pytest.log`。
+GPU 测试日志位于 `$MY_DFS/work/mylws/outputs/my_fp8_quant/20261118/pytest-block128.log`。

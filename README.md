@@ -5,7 +5,7 @@ Lightweight implementations and examples for personal learning.
 ## Lightweight Implementations
 
 - [myfa](src/README.md#myfa): TileLang Flash Attention with fixed-length and variable-length implementations.
-- [my_fp8_quant](src/README.md#my_fp8_quant): Grouped FP8 activation quantization in TileLang.
+- [my_fp8_quant](src/README.md#my_fp8_quant): 128×128 block-wise FP8 quantization in TileLang.
 
 ## Examples
 

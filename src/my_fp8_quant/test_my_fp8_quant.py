@@ -1,53 +1,53 @@
 import pytest
 import torch
-from tile_kernels.quant import per_token_cast
+from tile_kernels.quant import per_block_cast
 
 from my_fp8_quant import my_fp8_quant
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("group_size", [64, 128])
 @pytest.mark.parametrize("round_scale", [False, True])
-def test_quant(dtype: torch.dtype, group_size: int, round_scale: bool) -> None:
-    """对照 PyTorch 检查跨 tile 的非连续三维输入、逐组 scale 和 FP8 编码。"""
-    width = group_size * 3
+def test_partial_blocks(dtype: torch.dtype, round_scale: bool) -> None:
+    """对照 PyTorch 逐块检查非连续输入、两个方向的尾块和独立的 batch scale。"""
     rng = torch.Generator(device="cuda").manual_seed(42)
-    x = torch.randn((3, 7, width), device="cuda", generator=rng, dtype=dtype).transpose(0, 1)
-    y, scales = my_fp8_quant(x, group_size, round_scale)
-    groups = x.float().reshape(7, 3, 3, group_size)
-    expected_s = groups.abs().amax(dim=-1).clamp_min(1e-4) * (1.0 / 448.0)
-    if round_scale:
-        expected_s = torch.exp2(torch.ceil(torch.log2(expected_s)))
-    expected = (groups / expected_s.unsqueeze(-1)).clamp(-448, 448).to(torch.float8_e4m3fn)
-    torch.testing.assert_close(scales, expected_s, rtol=0, atol=0)
-    assert y.dtype == torch.float8_e4m3fn
-    assert torch.equal(y.view(torch.uint8), expected.reshape(x.shape).view(torch.uint8))
+    x = torch.randn((2, 259, 135), device="cuda", generator=rng, dtype=dtype).transpose(1, 2)
+    y, scales = my_fp8_quant(x, round_scale=round_scale)
+    assert y.shape == x.shape and y.dtype == torch.float8_e4m3fn
+    assert scales.shape == (2, 2, 3) and scales.dtype == torch.float32
+    for i in range(2):
+        for j in range(3):
+            tile = (..., slice(i * 128, (i + 1) * 128), slice(j * 128, (j + 1) * 128))
+            block = x[tile].float()
+            expected_s = block.abs().amax(dim=(-2, -1)).clamp_min(1e-4) / 448
+            if round_scale:
+                expected_s = torch.exp2(torch.ceil(torch.log2(expected_s)))
+            torch.testing.assert_close(scales[:, i, j], expected_s, rtol=2e-7, atol=0)
+            expected = (block / expected_s[:, None, None]).clamp(-448, 448).to(y.dtype)
+            assert torch.equal(y[tile].view(torch.uint8), expected.view(torch.uint8))
 
 
 @pytest.mark.parametrize("round_scale", [False, True])
 def test_deepseek(round_scale: bool) -> None:
-    """对照 DeepSeek TileKernels 检查零值、极小值和 2 的幂附近的量化结果。"""
-    peaks = torch.tensor([0, 1e-6, 446, 448, 450, 896], dtype=torch.bfloat16, device="cuda")
-    pattern = torch.tensor([1, -1, 0.5, -0.25], dtype=peaks.dtype, device=peaks.device)
-    x = (peaks[:, None] * pattern.repeat(32)).reshape(3, 256)
-    y, scales = my_fp8_quant(x, 128, round_scale)
-    ref_y, ref_s = per_token_cast(x, "e4m3", 128, round_sf=round_scale)
-    # act_quant 乘以预先舍入的 1/448，TileKernels 直接做除法；普通 scale 允许相差 1 ULP。
-    max_ulps = 0 if round_scale else 1
-    assert (scales.view(torch.int32) - ref_s.view(torch.int32)).abs().max().item() <= max_ulps
+    """用块内单点峰值验证整块共享 scale，并与 DeepSeek per_block_cast 对照。"""
+    peaks = torch.tensor([[0, 1e-6, 446], [448, 450, 896]], dtype=torch.bfloat16, device="cuda")
+    x = peaks.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1) * 0.25
+    x[127::128, 127::128] = -peaks
+    y, scales = my_fp8_quant(x, round_scale=round_scale)
+    ref_y, ref_s = per_block_cast(x, "e4m3", (128, 128), round_sf=round_scale)
+    assert scales.shape == (2, 3)
+    torch.testing.assert_close(scales, ref_s, rtol=0 if round_scale else 2e-7, atol=0)
     assert torch.equal(y.view(torch.uint8), ref_y.view(torch.uint8))
 
 
-@pytest.mark.parametrize("shape", [(0, 128), (3, 0), (0,)])
+@pytest.mark.parametrize("shape", [(0, 129), (3, 0), (0, 129, 1)])
 def test_empty(shape: tuple[int, ...]) -> None:
-    """空输入保留前导维度和每组一个 scale 的布局。"""
-    x = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
-    y, scales = my_fp8_quant(x)
+    """空输入保留前导维度及二维 block 的 scale 布局。"""
+    y, scales = my_fp8_quant(torch.empty(shape, device="cuda"))
     assert y.shape == shape and y.dtype == torch.float8_e4m3fn
-    assert scales.shape == (*shape[:-1], shape[-1] // 128) and scales.dtype == torch.float32
+    assert scales.shape == (*shape[:-2], (shape[-2] + 127) // 128, (shape[-1] + 127) // 128)
 
 
-def test_unaligned_width() -> None:
-    """最后一维不足整组时拒绝输入。"""
+def test_vector() -> None:
+    """一维输入缺少组成二维 block 的行轴。"""
     with pytest.raises(AssertionError):
-        my_fp8_quant(torch.empty(127, device="cuda"))
+        my_fp8_quant(torch.empty(128, device="cuda"))
