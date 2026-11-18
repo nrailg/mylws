@@ -1,33 +1,34 @@
 ---
 name: mylws-test
 description: >-
-  验证 mylws 学习示例与代码改动，运行本地轻量检查及远程 Gemini CPU/GPU/多节点测试，
-  维护可复现命令和验证结果。用户要求测试、跑测、pytest 或验证 mylws 示例时使用。
+  Verify mylws learning examples and code changes with lightweight local checks or
+  remote Gemini CPU, GPU, and multi-node tests. Use when asked to run tests or
+  pytest, or to verify a mylws example. Maintain reproducible commands and results.
 ---
 
 # mylws-test
 
-先按 [mylws-develop](../mylws-develop/SKILL.md) 确认示例入口、依赖和测试目标。常规回归直接运行已有测试；真实通信和 GPU 行为必须在对应环境验证。
+Use [mylws-develop](../mylws-develop/SKILL.md) to identify the example entry point, dependencies, and test objectives. Run existing tests for routine regression checks. Verify real communication and GPU behavior in the corresponding environment.
 
-测试代码同样必须非常简洁：直接调用示例并用必要的 `assert` 校验结果和非法情况，不增加生产级异常体系、兼容分支或通用测试封装。能在现有示例里直接断言的行为，不再复制一套实现来测试。
+Keep test code simple. Call the example directly and use the necessary `assert` statements to check results and reject invalid cases. Avoid production-grade exception hierarchies, compatibility branches, and generic test wrappers. Assert behavior in the existing example when possible so the test does not duplicate the implementation.
 
-测试也以人类可读性为重要目标：输入、调用、预期结果和断言应清楚可辨；使用明确命名和必要中间变量，不为减少行数把多个验证意图挤进复杂表达式。
+Keep inputs, calls, expected results, and assertions easy to identify. Use clear names and intermediate variables where helpful. Give each check room to express its intent clearly.
 
-GPU 示例的测试环境默认有 GPU。直接运行 CUDA 路径，保留必要的 GPU 数量和设备断言；不为本地无 GPU 增加 CPU fallback、自动设备选择或跳过失败的分支。实际环境不满足要求时报告阻塞，不降级运行。
+Assume GPU examples run in environments with GPUs. Test the CUDA path directly and keep the necessary GPU count and device assertions. Omit CPU fallback, automatic device selection, and failure-skipping branches for local environments without GPUs. Report a blocker if the environment falls short of the requirements.
 
-## 上机前检查
+## Checks before remote testing
 
-1. 用 `wx-remote-gemini` 连接用户指定的任务；不要复用历史 token 或凭旧 session ID 推断仍连接正确容器。
-2. 用 `wx-detect-my-dfs` 在当前会话确认 `MY_DFS`；用 `wx-sync-to-gpu-servers` 复用当前项目同步配置，确认代码已到位并核对关键文件校验值。
-3. 检查 Python、依赖版本和所需 API；优先复用满足要求的已有版本，不为跑测试直接升级整个环境。缺少依赖时按任务授权补齐，不能用 mock 的结果冒充真实通信。
-4. 按 `wx-mpirun` 从 `/etc/mpi/hostfile` 确认节点数；每节点只执行一次。用 hostname 验证实际参与节点，不把 launcher 当作全部节点信息。
-5. 用 `nvidia-smi` 或 `dguard status` 检查 GPU 占用。按 `wx-remote-gemini` 在 launcher 暂停正在运行的 dguard，短测通常 10 分钟；其他工作负载不能当作看护进程清理。
+1. Use `wx-remote-gemini` to connect to the task specified by the user. Use current session evidence to confirm the container and avoid reusing historical tokens or relying on old session IDs.
+2. Use `wx-detect-my-dfs` to confirm `MY_DFS` in the current session. Use `wx-sync-to-gpu-servers` with the project's existing sync configuration, confirm the code is present, and verify checksums for key files.
+3. Check Python, dependency versions, and the required APIs. Prefer existing versions that meet the requirements and install missing dependencies within the task's authorization. Real communication requires evidence from a real run.
+4. Use `wx-mpirun` to confirm the node count from `/etc/mpi/hostfile` and run once per node. Verify which nodes participated using their hostnames, including nodes beyond the launcher.
+5. Check GPU occupancy with `nvidia-smi` or `dguard status`. Follow `wx-remote-gemini` to pause a running dguard on the launcher, typically for 10 minutes for a short test. Leave other workloads alone.
 
-模型或数据测试先核对本地路径、版本和加载调用链，避免隐式联网。下载模型/数据按 `wx-download`；Python 包使用确认的包源，不把 Hugging Face 下载流程套到 pip 安装上。
+Before testing models or data, check local paths, versions, and the loading call chain to avoid implicit network access. Use `wx-download` for model and dataset downloads. Install Python packages from a verified package source.
 
-## 环境与 bash
+## Environment and bash
 
-长期 runner 使用当前会话确认的变量，只做简单存在性检查，不嵌入复杂路径搜索。每个独立 shell 重新激活，不依赖镜像 PATH 或上一条命令的 `source`：
+Use variables verified in the current session for long-lived runners, with simple existence checks and no complex path discovery. Reactivate the environment in each independent shell so it does not depend on the image's PATH or a previous command's `source`.
 
 ```bash
 set -Eeuo pipefail
@@ -39,48 +40,47 @@ test "$(command -v python)" = "$MYLWS_VENV/bin/python"
 python -c 'import sys; print(sys.executable, sys.prefix)'
 ```
 
-Ray/NIXL 示例曾在 `/opt/venvs/ray-nixl-test` 验证，该环境通过 `.pth` 复用 `/opt/venvs/carrot` 的 Ray/PyTorch。
-这只是已知环境：换机后必须重新核对环境及其基础路径，不能假定存在或悄悄回退到其他 Python。
+The Ray/NIXL example was verified in `/opt/venvs/ray-nixl-test`, which used a `.pth` file to reuse Ray and PyTorch from `/opt/venvs/carrot`.
+On a different machine, verify the environment and its base paths again. If the expected interpreter is unavailable, stop and diagnose the environment.
 
-给用户自行执行的一次性 bash 应短、可复制，可写入当前任务已确认的远端绝对路径；未知路径用清楚的待替换项。
-这类命令不包含 DFS 发现过程，也不直接复制进仓库长期 runner 或公开文档。
+Keep one-off bash commands for the user short and easy to copy. They may include remote absolute paths verified for the current task. Use clear placeholders for unknown paths. Keep DFS discovery out of these commands and keep the commands out of long-lived repository runners and public documentation.
 
-## 测试文件与记录
+## Test files and records
 
-- `tests/<主题>/` 只放独立测试代码及其必要资源。运行 `examples/` 中已有示例不需要另建测试代码、目录或 Markdown 档案。
-- 示例的验证命令、结果和必要限制直接写入 `examples/<主题>/README.md`；不另建验证记录文件再链接回来。独立测试需要说明时，优先放在已有相关 README 中。
-- 记录只保留最新日期/状态、复现命令、关键结果、必要限制和一个日志位置；复用 README 已有命令，不重复抄写。影响复现的环境信息写一行即可。
-- 重跑更新原记录，不逐次追加流水账；仍未解决的失败或阻塞保留一句原因。
-- 原始样本、排查过程、hash、PID、完整环境信息放日志，不堆进 Markdown；不填“未记录”等空字段。
-- 纯文档修改只检查文档，不上机重测。
+- Use `tests/<topic>/` for standalone tests and their required resources. Running an existing example under `examples/` requires no new test code, directory, or Markdown record.
+- Record an example's verification commands, results, and relevant limitations directly in `examples/<topic>/README.md`. For standalone tests that need documentation, prefer an existing relevant README.
+- Keep only the latest date and status, reproduction commands, key results, relevant limitations, and one log location. Reuse commands already in the README and record environment details that affect reproduction in one line.
+- Update the existing record after a rerun. Keep a sentence explaining any unresolved failure or blocker.
+- Keep raw samples, diagnostics, hashes, PIDs, and full environment details in logs. Omit empty fields such as "not recorded."
+- For documentation-only changes, check the documentation locally.
 
-## Ray 与多节点
+## Ray and multi-node testing
 
-- 先确认目标集群归属和占用；起测试集群前按 `wx-remote-gemini` 先 stop 再 start。已有无关任务运行时不能直接清空集群。
-- 临时单机示例可以由 `ray.init()` 启动本地实例；多节点测试先按 `wx-mpirun` 起集群，再显式传 `--address` 或 `RAY_ADDRESS`，不能各节点各起一个互不连接的实例。
-- 设置源码 `PYTHONPATH` 后再启动 Ray，mpirun 传递 `PATH`、`LIBRARY_PATH`、`LD_LIBRARY_PATH`、`PYTHONPATH` 及该测试需要的其他变量。worker 使用同一个已确认的 venv。
-- 使用 `python -m ray.scripts.scripts` 起停 Ray，避免复用环境时 PATH 中的 `ray` 脚本 shebang 指向基础 venv，导致新装的 NIXL 对 worker 不可见。
-- hostfile 的全部 `slots` 归一为 1，并使用 `wx-mpirun` 要求的 `bond1` 和 `routed direct` 参数；不要仅把 `slots=8` 改成 1 后假定其他 slot 值不存在。
-- MPI 命令成功不代表 Ray 所有节点已注册；检查 `ray.nodes()` 和资源。跨节点用例必须验证两端实际 node ID 不同。
+- Confirm ownership and occupancy of the target cluster first. Before starting a test cluster, follow `wx-remote-gemini` to stop Ray and then start it. Leave clusters with unrelated running tasks alone.
+- Temporary single-node examples may start a local instance via `ray.init()`. For multi-node tests, start the cluster through `wx-mpirun` and explicitly pass `--address` or `RAY_ADDRESS` so all nodes join the same cluster.
+- Set the source `PYTHONPATH` before starting Ray. Pass `PATH`, `LIBRARY_PATH`, `LD_LIBRARY_PATH`, `PYTHONPATH`, and any other required variables through mpirun. Use the same verified venv for all workers.
+- Start and stop Ray with `python -m ray.scripts.scripts`. When reusing an environment, the `ray` script on PATH can have a shebang pointing to the base venv, leaving newly installed NIXL unavailable to workers.
+- Normalize every hostfile `slots` value to 1 and use the `bond1` and `routed direct` options required by `wx-mpirun`. Check for slot values other than `slots=8`.
+- Check `ray.nodes()` and available resources to confirm registration after MPI succeeds. For cross-node cases, verify that the two endpoints have distinct node IDs.
 
-## Ray/NIXL 示例的验证范围
+## Ray/NIXL example verification scope
 
-下面是已有入口的回归命令，执行前完成上述环境和资源检查：
+After the environment and resource checks above, run the existing regression entry point.
 
 ```bash
 python examples/ray_nixl/main.py --size-mib 64
 ```
 
-- 用例需同一节点上 2 CPU 和 1 GPU，两个 Actor 共享该 GPU。检查两端 node ID 和 Ray GPU ID 相同；仅比较进程内的 `cuda:0` 不足以证明同卡。当前示例不提供跨节点模式。
-- 同时检查退出码、shape、dtype、设备和数据内容，以及日志中的实际 NIXL 后端；输出中的固定 `transport` 字段不能独立证明底层通信路径。
-- NIXL/UCX 初始化成功、跨节点成功均不等于已证明 RDMA；需要实际 transport 日志和相应设备证据。没有证据就写“未验证”，不把 TCP、共享内存或 CUDA IPC 结果表述成 RDMA。
-- 正确性和性能分开报告。包含首次连接、内存注册或冷启动的计时不能作为稳定带宽；只有性能任务才增加预热、重复采样与对应统计。
+- The case needs 2 CPUs and 1 GPU on the same node. The two actors share the GPU. Check that both endpoints have the same node ID and Ray GPU ID, since `cuda:0` is process-local. The example currently covers same-node transfers only.
+- Check the exit code, shape, dtype, device, tensor contents, and the actual NIXL backend in the logs. The fixed output field `transport` is insufficient evidence of the underlying communication path.
+- Confirm RDMA with transport logs and corresponding device evidence. Successful NIXL/UCX initialization or cross-node execution alone is insufficient. If evidence is missing, report RDMA as unverified. Identify TCP, shared memory, and CUDA IPC results by the actual transport.
+- Report correctness and performance separately. Exclude initial connection, memory registration, and cold start when measuring steady-state bandwidth. Treat timings that include those costs as startup-inclusive measurements. Add warmup, repeated samples, and statistics only for performance tasks.
 
-## 执行、产物与清理
+## Execution, artifacts, and cleanup
 
-- 先做能在本地完成的必要检查，再跑与改动相符的远端用例。使用 pytest 前确认测试存在及所用插件可用，不盲加 `--timeout`。
-- 长测试用 MCP 后台任务，按阶段检查输出；运行中每分钟报告新进展或阻塞。失败先定位原因，修复本地源码并重新同步，避免接收端热改。
-- 需要保留的结果和日志放在 `$MY_DFS/work/mylws/outputs/<主题>/<运行标识>/`，不存 token/密钥；确保运行产物不被同步回源码或误提交。
-- MCP 后台任务不使用 nohup 或 shell 重定向，完成后用 `remote_task_dump` 保存所需输出，再释放任务；没有留存价值的任务输出收集后 purge。
-- 只清理本次创建的 Actor/进程。独占测试集群优先 `python -m ray.scripts.scripts stop --force`，禁止 `pkill -9 python`；不要按运行时长自动删除接收端文件。
-- 若本次暂停了 dguard，结束后恢复看护或确认其定时恢复有效。最终报告实际通过项、未覆盖项、环境变更及证据/档案位置。
+- Run necessary local checks first and then remote cases relevant to the change. Verify that the tests and required plugins exist before running pytest. Add `--timeout` only when applicable.
+- For long tests, use an MCP background task and check output at each stage. Report new progress or blockers every minute while the test runs. On failure, diagnose the cause, fix the local source, and sync it again. Keep source edits off the receiver.
+- Save results and logs that need retention under `$MY_DFS/work/mylws/outputs/<topic>/<run-id>/`. Keep tokens and keys out of artifacts and keep artifacts out of source sync and commits.
+- Use MCP background tasks without nohup or shell redirection. After completion, save needed output with `remote_task_dump` and release the task. Purge tasks whose output need not be retained after collecting it.
+- Clean up only the actors and processes created for this task. Prefer `python -m ray.scripts.scripts stop --force` on a dedicated test cluster. Avoid `pkill -9 python` and automatic deletion of files on the sync receiver based on run duration.
+- If this task paused dguard, resume it or verify that automatic resumption is active. Report actual passes, coverage gaps, environment changes, and the location of evidence or archived results.

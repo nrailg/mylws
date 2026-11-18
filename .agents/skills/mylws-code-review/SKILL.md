@@ -1,146 +1,148 @@
 ---
 name: mylws-code-review
 description: >-
-  审查 mylws 的提交、分支差异或本地修改，覆盖 Style 和 Coding（Design）：
-  可读性、设计、行为正确性及项目规则；同时作为开发规范。审查默认只读，学习示例仅做轻量检查。
+  Review mylws commits, branch diffs, or local changes for Style and Coding (Design),
+  including readability, design, behavioral correctness, and project rules. Also
+  serves as the development standard. Reviews are read-only by default, with
+  lighter checks for learning examples.
 ---
 
-# mylws 代码审查
+# mylws code review
 
-开发和审查共用以下规则。开发前阅读 Style 和 Coding（Design），将相关规则用于实现和自查；是否启动独立 review 由 [mylws-develop](../mylws-develop/SKILL.md) 分流决定。用户请求 review、提交前审查或开发流程进入 Code Review 时，按 [审查流程](#审查流程) 确认范围，检查两部分并合并重复 findings；指定单类时仅检查对应部分。本 skill 不自行启动 agent 或循环。
+These rules apply to development and review. Before development, read Style and Coding (Design) and apply the relevant rules during implementation and self-review. Use [mylws-develop](../mylws-develop/SKILL.md) to decide when to start an independent review. For user-requested reviews, pre-commit reviews, or the Code Review stage of development, use the [review process](#review-process) to confirm scope, check both categories, and merge duplicate findings. If the user specifies a single category, check only that category. The skill itself starts no agents or review loops.
 
-审查覆盖请求范围内的 `src/`、`examples/`、`tests/` 和配套说明。先理解实现需求或示例的学习目标、接口和调用路径，不以风格扫描代替正确性与设计判断。
+Review `src/`, `examples/`, `tests/`, and related documentation within the requested scope. Understand the implementation requirements or the example's learning goal, interfaces, and call paths before assessing correctness, design, and style.
 
-## examples/ 的轻量审查
+## Lightweight review for examples/
 
-`examples/` 以简单、能读懂、清楚展示目标概念为准。以下约定优先于后文的严格 Style 和 Coding（Design）要求；`src/myfa` 等 `src/` 实现仍按完整规则审查。混合改动按路径分别适用。
+Review `examples/` for simplicity, readability, and a clear demonstration of the intended concept. These conventions take precedence over the stricter Style and Coding (Design) rules below. Apply the full rules to implementations under `src/`, including `src/myfa`. For mixed changes, apply the rules for each path.
 
-- 只关注明显影响理解、演示正确性或运行的问题，以及必要的信息保护；不逐项执行严格代码质量 checklist。
-- 允许直线代码、固定参数、少量重复和帮助理解的讲解注释；不为代码整洁要求拆函数、提取公共模块、引入抽象或完善通用接口。
-- 不强求 type hints、`@override`、docstring 模板、行宽或格式统一；不因 import 位置、命名偏好或注释形式单独提出 finding，除非确实影响理解或行为。
-- 验证围绕示例声明的用途，已有运行检查、输出或必要断言足够时，不要求另建单测、补齐所有边界情况或支持未声明的环境。
-- Findings 说明哪里难懂、演示了错误概念或会怎样运行失败，并给出最小修改方向；不输出无实际影响的风格建议。
+- Focus on material issues affecting comprehension, demonstration correctness, execution, or information protection. Skip the full code quality checklist.
+- Allow straight-line code, fixed parameters, modest duplication, and explanatory comments that aid understanding. Split functions, extract shared modules, add abstractions, or generalize interfaces only when the example needs it.
+- Treat type hints, `@override`, docstring templates, line width, and uniform formatting as optional. Report import placement, naming, or comment format only when it materially affects comprehension or behavior.
+- Verify the example's stated purpose. When existing run checks, output, or assertions are sufficient, skip separate unit tests, exhaustive edge cases, and support for environments outside the stated scope.
+- Explain what is hard to understand, which concept is demonstrated incorrectly, or how execution would fail. Suggest the smallest fix. Omit style advice with no practical impact.
 
-## 首要原则：代码必须非常简洁、便于人类阅读
+## Primary principle
 
-mylws 包含可复用的轻量实现和独立学习示例：`src/` 承载实现，`examples/` 承载演示程序。人类可读性是写代码的重要目标：读者应能顺着代码理解核心逻辑、数据流和必要约束。简洁以容易理解为前提，不追求最少行数。以下原则优先于本 skill 的其他风格建议：
+Keep code simple and easy to read. mylws contains reusable lightweight implementations under `src/` and standalone learning examples under `examples/`. A reader should be able to follow the core logic, data flow, and necessary constraints. Prefer clarity over a lower line count. These rules take precedence over the skill's other style guidance.
 
-- 只保留实现需求或演示目标必需的逻辑和排除非法情况的 `assert`。每个分支、参数、helper 和抽象都必须有当前任务的实际需要。
-- 能用一条 `assert` 表达的检查，就直接写 `assert`；不要展开为 `if ...: raise ...`，不要增加自定义异常或多层异常包装。
-- 第三方调用失败时让原始异常直接暴露。没有明确恢复需求，不加 `try/except`、重试、fallback、版本兼容分支或环境自动探测。
-- 优先直线代码和直接调用，不为未来扩展搭框架，不把简单示例写成可配置的通用工具。固定且清楚的示例参数可以直接写常量。
-- 简洁不能省掉关键约束：保留必要的输入、资源、shape/dtype、设备和结果断言，以及有实际必要的资源释放。
-- 开发 GPU 示例时，直接假定运行和测试环境一定有 GPU，使用 CUDA 和明确的 GPU 数量。不写 CPU fallback、`torch.cuda.is_available()` 驱动的设备选择或跳过执行分支，也不为本地 Mac 无 GPU 增加兼容逻辑。必要的资源约束用 `assert` 检查，失败直接暴露；只有用户明确要求 CPU 路径时才添加。
-- 使用含义明确的命名，按执行和数据流顺序组织代码；必要时保留中间变量、展开表达式或拆开断言，让读者无需在脑中解码。避免晦涩缩写、嵌套推导式和复杂的一行表达式。
-- Review 同时检查“能否删除无用代码”和“人能否直接读懂”。为可读性保留的几行清晰代码不算冗余；不靠增加抽象或堆砌注释弥补难懂的实现。
+- Keep only the logic required by the implementation or demonstration and the `assert` statements needed to reject invalid cases. Every branch, parameter, helper, and abstraction must serve a concrete need in the current task.
+- Express checks directly with `assert` when one assertion suffices. Avoid `if ...: raise ...` blocks, custom exceptions, and layers of exception wrapping for these checks.
+- Let original exceptions from third-party calls propagate. Add `try/except`, retries, fallback, version compatibility branches, or automatic environment detection only when an explicit recovery requirement calls for them.
+- Prefer straight-line code and direct calls. Keep simple examples focused on their demonstration and avoid scaffolding for future extensions. Use constants for clear, fixed example parameters.
+- Keep necessary assertions for inputs, resources, shape, dtype, devices, and results. Release resources where required.
+- For GPU examples, assume GPUs are available in the runtime and test environment. Use CUDA and an explicit GPU count. Check necessary resource constraints with `assert` and let failures surface. Omit CPU fallback, device selection based on `torch.cuda.is_available()`, skip branches, and compatibility logic for a GPU-free Mac. Add a CPU path only when the user explicitly requests one.
+- Use clear names and order code by execution and data flow. Keep useful intermediate variables and expand complex expressions or split assertions for readability. Avoid obscure abbreviations, nested comprehensions, and complicated one-liners.
+- In review, look for unused code and check whether a reader can follow the implementation directly. Keep clear lines that improve readability. Avoid using extra abstractions or comments to compensate for confusing code.
 
 ## Style
 
-### 命名、类型与 import
+### Naming, types, and imports
 
-- 依赖在模块顶部 import；禁止函数内 lazy import，也不用 `try/except ImportError` 延迟依赖错误。`TYPE_CHECKING` 下的 import 可以。
-- 函数签名写 type hints；覆盖方法使用当前 Python 版本支持的 `@override`。
-- 对齐项目已有格式配置；未配置时以 100 字符行宽为目标，不虚构已有 ruff 配置，不擅自提高目标实现或示例声明的 Python 最低版本。
-- 注释和文档用中文解释目的与行为，保留 `staging buffer`、`metadata` 等代码术语及标识符，不翻译名称。
+- Import dependencies at the top of the module. Imports under `TYPE_CHECKING` are allowed. Avoid function-local lazy imports and `try/except ImportError` that defers dependency errors.
+- Add type hints to function signatures. Use the `@override` supported by the project's Python version for overridden methods.
+- Follow the project's existing formatting configuration. With no configuration, aim for a 100-character line width. Verify whether a ruff configuration exists before relying on one. Preserve the minimum Python version declared for the implementation or example.
+- Write comments and documentation that explain purpose and behavior in Chinese. Keep code terms such as `staging buffer` and `metadata`, and identifiers, in their original form.
 
-### 注释与 docstring
+### Comments and docstrings
 
-- 注释只解释非直观意图、workaround、引用生命周期、shape、单位、布局或其他代码无法直接表达的约束。
-- 原理背景、完整流程和运行讲解放在对应实现或示例的 README；不要逐行翻译实现、保留注释掉的旧代码或加入调试历史。
-- helper、私有函数、一行 wrapper 通常不写 docstring。确有非直观接口约束时简短说明，不为简单示例套完整的 NumPy docstring 模板。
-- 函数体中的单条注释尽量一行，不复述函数名、变量名或显然的步骤。
-- 无意义注释/docstring、无理由的接口探测、lazy import、静默容错和无关改动均须在 review 中指出；开发自查时修正本次改动中的这些问题。
+- Use comments for non-obvious intent, workarounds, reference lifetimes, shape, units, layout, or other constraints the code cannot express directly.
+- Put background, full workflows, and run instructions in the relevant implementation or example README. Omit line-by-line paraphrases, commented-out old code, and debugging history.
+- Helpers, private functions, and one-line wrappers usually need no docstring. Briefly document non-obvious interface constraints when needed. Avoid applying the full NumPy docstring template to simple examples.
+- Aim for one line per comment within a function. Omit comments that repeat names or obvious steps.
+- Flag meaningless comments or docstrings, unjustified interface probing, lazy imports, silent error recovery, and unrelated changes. Fix these issues in your own changes during self-review.
 
-### 文档与进度记录
+### Documentation and progress records
 
-Markdown 也必须极简：只写读者运行、理解或判断结果必需的信息。进度记录保留最新状态、命令、结果及必要限制；细节放日志，历史交给 Git。不写工作流水账、重复总结或无内容的模板字段。同一信息只维护一处，其他地方用链接。具体测试记录见 [mylws-test](../mylws-test/SKILL.md)。
+Keep Markdown brief. Include only what readers need to run the work, understand it, or assess the result. Progress records keep the latest status, commands, results, and relevant limitations. Put details in logs and let Git retain history. Omit work diaries, repeated summaries, and empty template fields. Maintain each piece of information in one place and link to it elsewhere. See [mylws-test](../mylws-test/SKILL.md) for test records.
 
-### 审查判断
+### Review judgment
 
-- 区分可读性问题和行为缺陷；纯风格建议标为 Minor，不冒充运行时错误。
-- `getattr`、`.get()`、`try/except` 等只是检查线索，结合接口契约判断；不以关键词命中代替分析。
-- 为可读性保留的中间变量和展开步骤不算冗余；不机械缩短代码或要求统一历史风格。
+- Distinguish readability issues from behavioral defects. Mark pure style suggestions as Minor.
+- Treat `getattr`, `.get()`, and `try/except` as cues for inspection. Evaluate their use against the interface contract.
+- Keep intermediate variables and expanded steps that improve readability. Avoid mechanically shortening code or imposing uniformity on historical style.
 
-## Coding（Design）
+## Coding (Design)
 
-### 设计与行为
+### Design and behavior
 
-- **需求与范围**：实现是否完成本次功能、学习或验证目标？只做任务必需的修改，不顺便改名、调整签名、格式化全文件或重排逻辑。借鉴上游时保留与实现需求或学习目标有关的结构。
-- **职责与抽象**：读者能否顺着入口看懂核心计算、数据流和资源使用？只为真实复用或接口边界拆分，不为假想扩展增加框架、万能 helper 或继承层次。
-- **接口与状态**：检查输入、输出、副作用和资源所有权；接口变化追踪调用方、示例与测试。清理、异步完成和错误路径是否符合约定，资源是否在最后一次使用后才释放？
-- **正确性与边界**：检查空输入、长度与索引边界、shape、dtype、device、layout、stride、mask、数值容差及修改涉及的梯度路径。GPU kernel 还需核对线程到数据的映射、越界访问、同步和数据竞争；只检查与改动相关的约束。
-- **通信与并发**：涉及 Ray、NIXL、MPI 或异步 GPU 操作时，追踪进程/节点归属、buffer 生命周期、执行顺序和完成条件，不把 API 返回成功视为数据已可安全使用。
-- **验证与性能**：测试使用独立参考或契约预期验证可观察行为，不复制实现生成预期结果，不堆叠 mock 或通用封装。性能结论需实际测量及环境依据，区分冷启动和稳定运行。
-- **规则适用范围**：新规范用于本次新增或修改的部分；历史问题与本次 findings 分开，不借此扩大为全仓重构。
+- **Requirements and scope.** Check whether the implementation meets the feature, learning, or verification goal. Limit changes to the task. Avoid incidental renames, signature changes, whole-file formatting, and logic reordering. When adapting upstream work, preserve the structure relevant to the implementation or learning goal.
+- **Responsibilities and abstractions.** Check whether the entry point leads the reader through the core computation, data flow, and resource use. Split code for actual reuse or interface boundaries. Omit frameworks, general-purpose helpers, and inheritance layers for hypothetical extensions.
+- **Interfaces and state.** Check inputs, outputs, side effects, and resource ownership. Trace interface changes through callers, examples, and tests. Check cleanup, asynchronous completion, and error paths against the contract. Verify that resources are released after their final use.
+- **Correctness and edge cases.** Check constraints relevant to the change, including empty input, length and index boundaries, shape, dtype, device, layout, stride, masks, numerical tolerance, and affected gradient paths. For GPU kernels, also check thread-to-data mapping, out-of-bounds access, synchronization, and data races.
+- **Communication and concurrency.** For Ray, NIXL, MPI, or asynchronous GPU operations, trace process and node placement, buffer lifetimes, execution order, and completion conditions. Verify when data is actually safe to use after an API returns successfully.
+- **Verification and performance.** Test observable behavior using an independent reference or the contract's expected results. Avoid computing expected results by duplicating the implementation, layering mocks, or adding generic wrappers. Base performance conclusions on measurements and the environment, and distinguish cold starts from steady-state runs.
+- **Applicability of rules.** Apply new rules to additions and changes in scope. Keep historical issues separate from current findings and avoid repository-wide refactoring.
 
-### 明确接口，及时失败
+### Explicit interfaces and early failures
 
-- 必需字段直接访问，数据字段用 `batch["tokens"]` 这样的显式契约；默认不用 `getattr` / `hasattr` 探测已有接口。
-- 针对明确的第三方版本直接调用 API，不为假想的版本差异增加 adapter、`Protocol` 或接口探测分支。
-- 禁止吞异常、猜替代值、跳过失败项，或在失败后自动切换设备、transport、数据来源和路径。允许的默认值和恢复行为必须事先写入接口或配置契约。
-- 内部不变式和用户输入合法性使用 `assert condition`，需要解释时附简短消息；禁止为这类检查改用 `raise ValueError` / `raise TypeError` / `raise RuntimeError`。不要用 `python -O` 运行依赖断言的检查。
-- 不捕获异常只为换一种报错措辞；必要的清理逻辑不能掩盖主任务失败。
-- 区分字段缺失、`None`、`False` 和 `0`；不要用 `or default` 覆盖有效值。
+- Access required fields directly. Use explicit data contracts such as `batch["tokens"]`. Avoid probing established interfaces with `getattr` or `hasattr` by default.
+- Call the API for the known third-party version directly. Add adapters, `Protocol`, or interface probing only for actual version requirements.
+- Let failures surface. Do not swallow exceptions, guess substitutes, skip failed items, or automatically switch device, transport, data source, or path. Define any allowed defaults or recovery behavior in the interface or configuration contract in advance.
+- Use `assert condition` for internal invariants and user input validation. Add a brief message when needed. Avoid `raise ValueError`, `raise TypeError`, or `raise RuntimeError` for these checks. Run assertion-dependent checks with assertions enabled, without `python -O`.
+- Catch exceptions only when there is a purpose beyond rewording the error. Make sure necessary cleanup preserves the original task failure.
+- Distinguish missing fields from `None`, `False`, and `0`. Keep valid values when applying defaults and avoid `or default` when it would overwrite them.
 
-### 项目定位与目录
+### Project purpose and layout
 
-mylws 包含轻量实现、独立学习示例和笔记。`src/myfa` 属于 `src/` 的实现模块，按其接口契约、正确性和复用需求开发与审查；不因仓库具有学习用途就将其视为 example。
+mylws contains lightweight implementations, standalone learning examples, and notes. Treat `src/myfa` as an implementation module and develop and review it according to its interface contract, correctness, and reuse requirements.
 
 ```text
-src/<主题>/        可复用的轻量实现，如 src/myfa
-examples/<主题>/
-  main.py           示例入口，沿用已有入口名也可以
-  requirements.txt  该示例的依赖
-  README.md         原理、环境、运行命令和验证边界
-tests/<主题>/       独立测试代码
-.agents/skills/     当前项目的开发、审查和测试 skill
+src/<topic>/        Reusable lightweight implementations, such as src/myfa
+examples/<topic>/
+  main.py           Example entry point (existing names are also fine)
+  requirements.txt  Dependencies for this example
+  README.md         Concepts, environment, run commands, and verification scope
+tests/<topic>/       Standalone tests
+.agents/skills/     Development, review, and testing skills for this project
 ```
 
-- `src/<主题>/` 放可被 import 或调用的实现；`examples/<主题>/` 放讲解概念或演示用法的独立程序；`tests/<主题>/` 放独立测试代码。沿用已有测试位置，如 `src/myfa/test_*.py`，不为统一目录而迁移。
-- `src` 的接口、依赖和使用方式写入已有相关 README（如 `src/README.md`）；不强制每个主题新建说明文件。
-- 以下示例组织规则适用于 `examples/`；不要求 `src/` 模块具有独立演示入口或按示例组织依赖。
-- 一个示例围绕一个明确的问题，保持能单独理解和运行；新增示例在根 README 添加入口。
-- 依赖按示例隔离，不把所有示例强行合并为一个安装包或统一环境。
-- 演示 Ray/NIXL 等机制时可以直接使用第三方 API；不要照搬 Carrot 的私有 Ray 层、trainer、distributed 模块边界。
-- 参数解析与演示逻辑按需要分开。只在真实复用或接口边界需要时提取公共模块，不为两行代码增加 wrapper。
-- README 写清设备、节点数、资源、数据路径、运行命令和成功条件，区分示意、实测和未验证的能力。
-- 示例自带的断言、运行检查及验证结果留在 `examples/<主题>/`，结果简记在该示例 README；不为跑过示例而在 `tests/` 另建文件或测试档案。
+- Put importable or callable implementations in `src/<topic>/`, standalone programs that explain concepts or demonstrate usage in `examples/<topic>/`, and standalone tests in `tests/<topic>/`. Keep existing tests where they are, such as `src/myfa/test_*.py`.
+- Document `src` interfaces, dependencies, and usage in an existing relevant README, such as `src/README.md`. A separate README for each topic is optional.
+- Apply the following organization rules to `examples/`. Standalone demonstration entry points and example-specific dependency layouts are optional for `src/` modules.
+- Keep each example focused on one question and make it understandable and runnable on its own. Add new examples to the root README.
+- Isolate dependencies by example. Avoid forcing all examples into a single package or environment.
+- Use third-party APIs directly when demonstrating mechanisms such as Ray or NIXL. Avoid copying Carrot's private Ray layer or its trainer and distributed module boundaries.
+- Separate argument parsing from demonstration logic as needed. Extract shared modules only for actual reuse or interface boundaries. Keep two-line operations inline when a wrapper serves no purpose.
+- Document devices, node counts, resources, data paths, run commands, and success criteria in the README. Distinguish illustrative, measured, and unverified capabilities.
+- Keep example assertions, run checks, and verification results in `examples/<topic>/`. Record results briefly in the example README. Running an example alone requires no separate test files or records in `tests/`.
 
-### 测试与可读性
+### Testing and readability
 
-功能与修复提供能保护实际行为的轻量验证，具体执行见 [mylws-test](../mylws-test/SKILL.md)。不要用长时间 e2e 替代可以独立验证的逻辑；文档或低影响改动不为凑数添加测试。
+Provide lightweight verification that protects actual behavior for features and fixes. Follow [mylws-test](../mylws-test/SKILL.md) to run it. Verify logic independently where possible and reserve long end-to-end runs for behavior that requires them. Add tests for documentation or low-impact changes only when they serve a purpose.
 
-新增或修改测试时：
+When adding or changing tests, follow these rules.
 
-- 每个测试函数开头用一句中文说明验证意图，随后直接构造输入、调用和断言。
-- 只为非直观的输入、mock 边界或数值容差补充说明；不要求每个显然的逻辑块写注释，不为简单断言增加 fixture、helper 或测试框架封装。
-- 测试结论只覆盖实际执行的环境；语法通过不能写成通信通过，单机通过不能写成跨节点通过。
+- Start each test function with one sentence in Chinese explaining what it verifies. Then construct the inputs, make the call, and assert the result directly.
+- Explain only non-obvious inputs, mock boundaries, and numerical tolerances. Keep obvious blocks free of unnecessary comments and simple assertions free of extra fixtures, helpers, or framework wrappers.
+- Limit conclusions to the environment actually tested. Report syntax, communication, single-node, and cross-node results according to what ran.
 
-### 信息保护
+### Information protection
 
-不把 Gemini token、密钥、代理认证、个人绝对 DFS 路径或原始环境变量转储写入代码、README、测试档案和提交。
-通用命令使用 `MY_DFS` 等已确认变量；一次性用户命令的路径例外见 `mylws-test`。
-公开引用区分官方来源和内部部署信息，日志入库前检查敏感内容；原始远端产物保存在个人 DFS 的项目目录。
+Keep Gemini tokens, secrets, proxy credentials, personal absolute DFS paths, and raw environment dumps out of code, README files, test records, and commits.
+Use verified variables such as `MY_DFS` in reusable commands. See `mylws-test` for path exceptions in one-off user commands.
+Distinguish official sources from internal deployment details in public references. Check logs for sensitive content before adding them to the repository. Store raw remote artifacts in the project directory on the user's DFS.
 
-## 审查流程
+## Review process
 
-供 Style 和 Coding（Design）共用；开发中的独立 Code Review 同样使用本流程，小改动自查只应用相关规则。
+Use this process for both Style and Coding (Design), including independent Code Review during development. Apply only the relevant rules when self-reviewing small changes.
 
-### 范围与证据
+### Scope and evidence
 
-- 确认 repo root、变更目的和对比基准。指定项目与 Git root 不匹配或 ref 不存在时说明阻塞，不自动改审其他仓库。
-- 本地审查包含 staged、unstaged 和相关 untracked 文件；完整读取 diff，新增文件单独读取，不把依赖、生成物或嵌套仓库自动当作项目代码。
-- 分支审查确认 source/target 并固定 SHA，使用 `git diff <target_sha>...<source_sha>`；指定 commit 或比较方式时按用户要求。不猜默认分支，也不默认 source 是当前 `HEAD`。说明是否包含工作区改动。
-- PR/MR 审查从页面核对仓库、source/target 和 head SHA；需要 fetch 时先核对 remote，用固定版本审查，不切换用户工作区。版本变化后重新确认审查范围。
-- 请求范围内的 `examples/` 按上述轻量要求审查，其他实现按完整规则审查。阅读变更及理解其行为所需的定义、调用方、配置、README 和测试；没有改动与缺少比较基准分别说明。
-- 默认只读，不修复、提交或发布评论。用户同时要求修复时才修改；对外发布评论需有用户明确授权，不从 review 请求推断发布权限。
-- 需要运行验证时按 [mylws-test](../mylws-test/SKILL.md) 选择最小有效范围。未运行、失败、跳过和通过分别说明，本地语法检查不代表 GPU 或多节点行为通过。
+- Confirm the repository root, purpose of the change, and comparison baseline. Report a blocker if the requested project does not match the Git root or the ref is missing. Stay within the requested repository.
+- Include staged, unstaged, and relevant untracked files in a local review. Read the full diff and inspect new files separately. Verify whether dependencies, generated files, and nested repositories are part of the project scope before reviewing them.
+- For branch reviews, confirm source and target and pin their SHAs. Use `git diff <target_sha>...<source_sha>` unless the user specifies a commit or comparison method. Confirm the default branch or source explicitly when needed. State whether workspace changes are included.
+- For PR or MR reviews, verify the repository, source, target, and head SHA from the page. If a fetch is needed, verify the remote first. Review a pinned version without switching the user's workspace. Reconfirm scope if the version changes.
+- Apply lightweight review to `examples/` and the full rules to other implementations in scope. Read the changes and the definitions, callers, configuration, README files, and tests needed to understand their behavior. Distinguish an empty diff from a missing comparison baseline.
+- Default to read-only review. Modify files only when the user also asks for fixes. Commits and published comments require authorization. A review request alone grants no permission to publish.
+- When verification is needed, use [mylws-test](../mylws-test/SKILL.md) to choose the smallest effective scope. Report checks as not run, failed, skipped, or passed as appropriate. A local syntax check verifies syntax only.
 
 ### Findings
 
-- 只报告本次引入且值得修复的具体问题，给出文件及最短有用行范围、触发条件、影响和最小修复方向。
-- Style 和 Coding（Design）检查同一根因时合并为一条 finding；设计问题可引用多个位置证明实际耦合、重复修改或契约破坏，不以假想扩展要求抽象。
-- 项目规则 finding 引用适用规则的位置；普通缺陷无需强贴规则。不把其他仓库约定或个人偏好升级为本项目要求。
-- Blocker：必须修复的正确性、安全或数据损坏问题；Major：有具体影响的设计、维护或验证问题；Minor：无行为影响的风格建议。用户指定优先级格式时遵循其要求。
-- 按严重程度输出合并后的 findings，再简述实际范围、验证和限制；历史问题、待确认项与 findings 分开。没有可确认问题时直说，不用空模板填充输出。
-- 单类审查的结论只覆盖该类；Style 无 findings 不代表功能或设计已通过。
+- Report only concrete issues introduced by the change that are worth fixing. Include the file and smallest useful line range, triggering condition, impact, and smallest fix.
+- Merge Style and Coding (Design) findings with the same root cause. Cite multiple locations for design issues when needed to show actual coupling, repeated changes, or a broken contract. Require abstractions only for demonstrated needs.
+- For project-rule findings, cite the applicable rule. Ordinary defects need no forced rule reference. Keep other repositories' conventions and personal preferences out of this project's requirements.
+- **Blocker** covers correctness, security, or data corruption issues that must be fixed. **Major** covers design, maintenance, or verification issues with concrete impact. **Minor** covers style suggestions without behavioral impact. Use the user's priority format when specified.
+- Order the merged findings by severity, then briefly describe scope, verification, and limitations. Report historical issues and open questions separately from findings. If no issue can be confirmed, say so directly.
+- Limit single-category review conclusions to that category. A Style review with no findings covers Style alone.
