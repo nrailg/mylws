@@ -3,17 +3,17 @@
 CuTe 用 `Layout` 描述坐标到 offset 的映射，再用 `Tensor` 将映射应用到数据。
 这组例子从手写索引开始，逐步走到 tile、thread partition 和 layout algebra；每个 `.cpp` 都有独立的 `main()`。
 
-- 所有程序在 **host CPU** 上执行，不启动 CUDA kernel，也不需要 GPU。
+- `t01` 到 `t09` 在 **host CPU** 上执行。[sgemm_1](#sgemm_1cuda-gemm) 需要一张 CUDA GPU。
 - 编译仍需要 CUTLASS 和 CUDA Toolkit headers；这组依赖按 CUTLASS **v4.8.1** 固定。
-- 每课先手算输出，再运行核对；断言通过时打印 `tXX PASS`。不要加 `-DNDEBUG`。
+- CPU 例子先手算输出，再运行核对。断言通过时打印 `tXX PASS`。不要加 `-DNDEBUG`。
 
 ## 编译运行
 
 建议在已有 CUDA Toolkit 的 Linux 开发环境运行，需要 C++17 compiler 和 Make。
-CuTe 是 header-only，这些例子无需编译 CUTLASS 库或链接 CUDA runtime。
+CuTe 是 header-only。CPU 例子用到 CUTLASS 和 CUDA headers。
 
 Gemini 上统一使用 `$MY_DFS/work/deps/cutlass-v4.8.1`。
-当前测试服务器已准备好依赖，无需重新 clone；确认当前会话的 `MY_DFS` 后设置：
+确认当前会话的 `MY_DFS` 后设置依赖路径。
 
 ```bash
 export CUTLASS_DIR="${MY_DFS:?set MY_DFS from the current Gemini session}/work/deps/cutlass-v4.8.1"
@@ -27,7 +27,7 @@ mkdir -p "$(dirname "$CUTLASS_DIR")"
 git clone --depth 1 --branch v4.8.1 https://github.com/NVIDIA/cutlass.git "$CUTLASS_DIR"
 ```
 
-在 mylws 根目录增量编译并运行全部例子：
+在 mylws 根目录增量编译并运行全部 CPU 例子。
 
 ```bash
 cd "$MY_DFS/work/mylws"
@@ -207,6 +207,30 @@ target shape 为 `(8,9)`。CUTLASS v4.8.1 内部 `ceil_div((8,9),6)` 得到 `(2,
 make -C examples/cute ../../outputs/cute/build/t09_complement_divide
 outputs/cute/build/t09_complement_divide
 ```
+
+## sgemm_1（CUDA GEMM）
+
+[sgemm_1.cu](sgemm_1.cu) 沿用 CUTLASS v4.8.1 教程中的 `gemm_device`、`gemm_nt` 和
+`gemm_tn`。每个 CTA 用 `local_tile` 选取数据，线程按 `tA` 和 `tB` 把 A、B 搬到
+shared memory，再按 `tC` 分工调用 `cute::gemm` 累加，最后用 `axpby` 写回 C。
+参考 [NVIDIA CuTe GEMM 教程](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/0x_gemm_tutorial.html#sgemm-1-cu)。
+
+沿用上面的 `CUTLASS_DIR` 和 `CUDA_HOME`，在有 `nvcc` 和一张 CUDA GPU 的 Linux 环境运行。
+
+```bash
+make -C examples/cute check-gpu
+```
+
+默认用 `CUDA_ARCH=native`。需要指定架构时可传入 `CUDA_ARCH=sm_90`，切换架构后加 `-B`
+重新编译。教程 kernel 按完整的 `(128, 128, 8)` tile 读写，demo 固定使用对齐的
+`(M, N, K) = (256, 384, 24)`。程序在 GPU 0 上运行 NT 和 TN 两种布局，用 CPU 逐元素
+核对 `C = alpha * A * B^T + beta * C`，其中 CuTe 的 B 逻辑 shape 是 `(N, K)`。
+全部元素正确时分别打印 `sgemm_1 NT PASS` 和 `sgemm_1 TN PASS`。
+
+2026-11-20 在单节点 Gemini launcher 的 NVIDIA H20 上用 CUDA 12.8.93、GCC 12.3 和
+CUTLASS v4.8.1 验证。`make -C examples/cute check` 的 9 个 CPU 例子和
+`make -C examples/cute check-gpu` 的 NT、TN 两种布局均通过。
+日志位于 Gemini 项目目录的 `outputs/cute/20261120-sgemm-1/`。
 
 ## 后续衔接
 
