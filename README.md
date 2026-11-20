@@ -14,4 +14,4 @@ Lightweight implementations and examples for personal learning.
 - [TQ as KV](examples/tq/README.md): Read and write tensors by sample key and field name.
 - [Mooncake quickstart](examples/mooncake/README.md): Master setup, Store KV reads and writes, and memory transfers with Transfer Engine.
 - [TensorDict quickstart](examples/tq/README.md#tensordict-quickstart): Batch indexing, field operations, and batch transformations.
-- [Langfuse quickstart](examples/langfuse/README.md): Trace a question-answering request with retrieval and generation.
+- [Langfuse quickstart](examples/langfuse/README.md): Trace a recursive tree of questions and generated answers.
