@@ -223,14 +223,14 @@ make -C examples/cute check-gpu
 
 默认用 `CUDA_ARCH=native`。需要指定架构时可传入 `CUDA_ARCH=sm_90`，切换架构后加 `-B`
 重新编译。教程 kernel 按完整的 `(128, 128, 8)` tile 读写，demo 固定使用对齐的
-`(M, N, K) = (256, 384, 24)`。程序在 GPU 0 上运行 NT 和 TN 两种布局，用 CPU 逐元素
-核对 `C = alpha * A * B^T + beta * C`，其中 CuTe 的 B 逻辑 shape 是 `(N, K)`。
-全部元素正确时分别打印 `sgemm_1 NT PASS` 和 `sgemm_1 TN PASS`。
+`(M, N, K) = (256, 384, 24)`。程序默认在 GPU 0 上运行 NT，也可取消注释
+`main()` 中的 `check_gemm<false>()` 来运行 TN。两种布局都用 CPU 逐元素核对
+`C = alpha * A * B^T + beta * C`，其中 CuTe 的 B 逻辑 shape 是 `(N, K)`。
 
-2026-11-20 在单节点 Gemini launcher 的 NVIDIA H20 上用 CUDA 12.8.93、GCC 12.3 和
-CUTLASS v4.8.1 验证。`make -C examples/cute check` 的 9 个 CPU 例子和
-`make -C examples/cute check-gpu` 的 NT、TN 两种布局均通过。
-日志位于 Gemini 项目目录的 `outputs/cute/20261120-sgemm-1/`。
+2026-11-21 在单节点 Gemini launcher 的 NVIDIA H20 上用 CUDA 12.8.93、GCC 12.3 和
+CUTLASS v4.8.1 运行 `check-gpu CUDA_ARCH=sm_90`。在临时测试副本中启用 TN 后，
+`sgemm_1 NT PASS` 和 `sgemm_1 TN PASS` 均通过，退出码为 0。
+日志位于 Gemini 项目目录的 `outputs/cute/20261121-sgemm-select/check-gpu.log`。
 
 ## 后续衔接
 
