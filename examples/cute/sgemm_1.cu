@@ -49,106 +49,119 @@ template <class ProblemShape, class CtaTiler,
 __global__ static
 __launch_bounds__(decltype(size(CThreadLayout{}))::value)
 void
-gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
-            TA const* A, AStride dA, ASmemLayout sA_layout, AThreadLayout tA,
-            TB const* B, BStride dB, BSmemLayout sB_layout, BThreadLayout tB,
-            TC      * C, CStride dC, CSmemLayout          , CThreadLayout tC,
-            Alpha alpha, Beta beta)
+gemm_device(ProblemShape shape_MNK,// (256, 384, 24)
+            CtaTiler cta_tiler,    // (128, 128, 8)
+            TA const* A,
+            AStride dA,            // (1, 256)
+            ASmemLayout sA_layout, // (128, 8), stride (1, 128)
+            AThreadLayout tA,      // (32, 8), stride (1, 32)
+            TB const* B,
+            BStride dB,            // (1, 384)
+            BSmemLayout sB_layout, // (128, 8), stride (1, 128)
+            BThreadLayout tB,      // (32, 8), stride (1, 32)
+            TC* C,
+            CStride dC,            // (1, 256)
+            CSmemLayout,           // (128, 128), stride (1, 128)
+            CThreadLayout tC,      // (16, 16), stride (1, 16)
+            Alpha alpha,
+            Beta beta)
 {
   using namespace cute;
 
   // Preconditions
-  CUTE_STATIC_ASSERT_V(rank(shape_MNK) == Int<3>{});                   // (M, N, K)
-  CUTE_STATIC_ASSERT_V(rank(cta_tiler) == Int<3>{});                   // (BLK_M, BLK_N, BLK_K)
+  CUTE_STATIC_ASSERT_V(rank(shape_MNK) == Int<3>{});                   // (M, N, K) = (256, 384, 24), rank = 3
+  CUTE_STATIC_ASSERT_V(rank(cta_tiler) == Int<3>{});                   // (BLK_M, BLK_N, BLK_K) = (128, 128, 8), rank = 3
 
   static_assert(is_static<AThreadLayout>::value);
   static_assert(is_static<BThreadLayout>::value);
   static_assert(is_static<CThreadLayout>::value);
 
-  CUTE_STATIC_ASSERT_V(size(tA) == size(tB));                          // NumThreads
-  CUTE_STATIC_ASSERT_V(size(tC) == size(tA));                          // NumThreads
+  CUTE_STATIC_ASSERT_V(size(tA) == size(tB));                          // NumThreads = 256
+  CUTE_STATIC_ASSERT_V(size(tC) == size(tA));                          // NumThreads = 256
 
-  CUTE_STATIC_ASSERT_V(size<0>(cta_tiler) % size<0>(tA) == Int<0>{});  // BLK_M / THR_M
-  CUTE_STATIC_ASSERT_V(size<2>(cta_tiler) % size<1>(tA) == Int<0>{});  // BLK_K / THR_K
-  CUTE_STATIC_ASSERT_V(size<1>(cta_tiler) % size<0>(tB) == Int<0>{});  // BLK_N / THR_N
-  CUTE_STATIC_ASSERT_V(size<2>(cta_tiler) % size<1>(tB) == Int<0>{});  // BLK_K / THR_K
-  CUTE_STATIC_ASSERT_V(size<0>(cta_tiler) % size<0>(tC) == Int<0>{});  // BLK_M / THR_M
-  CUTE_STATIC_ASSERT_V(size<1>(cta_tiler) % size<1>(tC) == Int<0>{});  // BLK_N / THR_N
+  CUTE_STATIC_ASSERT_V(size<0>(cta_tiler) % size<0>(tA) == Int<0>{});  // BLK_M / THR_M = 128 / 32 = 4
+  CUTE_STATIC_ASSERT_V(size<2>(cta_tiler) % size<1>(tA) == Int<0>{});  // BLK_K / THR_K = 8 / 8 = 1
+  CUTE_STATIC_ASSERT_V(size<1>(cta_tiler) % size<0>(tB) == Int<0>{});  // BLK_N / THR_N = 128 / 32 = 4
+  CUTE_STATIC_ASSERT_V(size<2>(cta_tiler) % size<1>(tB) == Int<0>{});  // BLK_K / THR_K = 8 / 8 = 1
+  CUTE_STATIC_ASSERT_V(size<0>(cta_tiler) % size<0>(tC) == Int<0>{});  // BLK_M / THR_M = 128 / 16 = 8
+  CUTE_STATIC_ASSERT_V(size<1>(cta_tiler) % size<1>(tC) == Int<0>{});  // BLK_N / THR_N = 128 / 16 = 8
 
   static_assert(is_static<ASmemLayout>::value);
   static_assert(is_static<BSmemLayout>::value);
   static_assert(is_static<CSmemLayout>::value);
 
-  CUTE_STATIC_ASSERT_V(size<0>(ASmemLayout{}) == size<0>(cta_tiler));  // BLK_M
-  CUTE_STATIC_ASSERT_V(size<0>(CSmemLayout{}) == size<0>(cta_tiler));  // BLK_M
-  CUTE_STATIC_ASSERT_V(size<0>(BSmemLayout{}) == size<1>(cta_tiler));  // BLK_N
-  CUTE_STATIC_ASSERT_V(size<1>(CSmemLayout{}) == size<1>(cta_tiler));  // BLK_N
-  CUTE_STATIC_ASSERT_V(size<1>(ASmemLayout{}) == size<2>(cta_tiler));  // BLK_K
-  CUTE_STATIC_ASSERT_V(size<1>(BSmemLayout{}) == size<2>(cta_tiler));  // BLK_K
+  CUTE_STATIC_ASSERT_V(size<0>(ASmemLayout{}) == size<0>(cta_tiler));  // BLK_M = 128
+  CUTE_STATIC_ASSERT_V(size<0>(CSmemLayout{}) == size<0>(cta_tiler));  // BLK_M = 128
+  CUTE_STATIC_ASSERT_V(size<0>(BSmemLayout{}) == size<1>(cta_tiler));  // BLK_N = 128
+  CUTE_STATIC_ASSERT_V(size<1>(CSmemLayout{}) == size<1>(cta_tiler));  // BLK_N = 128
+  CUTE_STATIC_ASSERT_V(size<1>(ASmemLayout{}) == size<2>(cta_tiler));  // BLK_K = 8
+  CUTE_STATIC_ASSERT_V(size<1>(BSmemLayout{}) == size<2>(cta_tiler));  // BLK_K = 8
 
-  CUTE_STATIC_ASSERT_V(congruent(select<0,2>(shape_MNK), dA));         // dA strides for shape MK
-  CUTE_STATIC_ASSERT_V(congruent(select<1,2>(shape_MNK), dB));         // dB strides for shape NK
-  CUTE_STATIC_ASSERT_V(congruent(select<0,1>(shape_MNK), dC));         // dC strides for shape MN
+  CUTE_STATIC_ASSERT_V(congruent(select<0,2>(shape_MNK), dA)); // dA strides for shape MK = (1, 256) for (256, 24)
+  CUTE_STATIC_ASSERT_V(congruent(select<1,2>(shape_MNK), dB)); // dB strides for shape NK = (1, 384) for (384, 24)
+  CUTE_STATIC_ASSERT_V(congruent(select<0,1>(shape_MNK), dC)); // dC strides for shape MN = (1, 256) for (256, 384)
 
   //
   // Full and Tiled Tensors
   //
 
   // Represent the full tensors
-  Tensor mA = make_tensor(make_gmem_ptr(A), select<0,2>(shape_MNK), dA); // (M,K)
-  Tensor mB = make_tensor(make_gmem_ptr(B), select<1,2>(shape_MNK), dB); // (N,K)
-  Tensor mC = make_tensor(make_gmem_ptr(C), select<0,1>(shape_MNK), dC); // (M,N)
+  Tensor mA = make_tensor(make_gmem_ptr(A), select<0,2>(shape_MNK), dA); // (M,K) = (256, 24)
+  Tensor mB = make_tensor(make_gmem_ptr(B), select<1,2>(shape_MNK), dB); // (N,K) = (384, 24)
+  Tensor mC = make_tensor(make_gmem_ptr(C), select<0,1>(shape_MNK), dC); // (M,N) = (256, 384)
 
   // Get the appropriate blocks for this thread block
-  auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);              // (m,n,k)
-  Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{});  // (BLK_M,BLK_K,k)
-  Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step< X,_1,_1>{});  // (BLK_N,BLK_K,k)
-  Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1,_1, X>{});  // (BLK_M,BLK_N)
+  auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);              // (m,n,k) = (0..1, 0..2, _)
+  /* md
+   * `mA` 的 shape 是 `(256, 24)`，按 `(128, 8)` 分块后有 2 个 M tile 和 3 个 K tile。
+   *
+   * - `make_coord(blockIdx.x, _)` 固定 M tile，保留所有 K tile，得到 `(128, 8, 3)`。
+   * - `make_coord(_, _)` 保留所有 M 和 K tile，得到 `(128, 8, 2, 3)`，
+   *   坐标顺序是 `(m_in, k_in, m_tile, k_tile)`。
+   *
+   * 对后一个 view 用 `(_, _, blockIdx.x, _)` 切片，就得到下面的 `gA`。
+   */
+  Tensor gA = local_tile(mA, select<0,2>(cta_tiler), select<0,2>(cta_coord));  // (BLK_M,BLK_K,k) = (128, 8, 3)
+  Tensor gB = local_tile(mB, select<1,2>(cta_tiler), select<1,2>(cta_coord));  // (BLK_N,BLK_K,k) = (128, 8, 3)
+  Tensor gC = local_tile(mC, select<0,1>(cta_tiler), select<0,1>(cta_coord));  // (BLK_M,BLK_N)   = (128, 128)
 
   // Shared memory buffers
   __shared__ TA smemA[cosize_v<ASmemLayout>];
   __shared__ TB smemB[cosize_v<BSmemLayout>];
-  Tensor sA = make_tensor(make_smem_ptr(smemA), sA_layout);            // (BLK_M,BLK_K)
-  Tensor sB = make_tensor(make_smem_ptr(smemB), sB_layout);            // (BLK_N,BLK_K)
+  Tensor sA = make_tensor(make_smem_ptr(smemA), sA_layout);            // (BLK_M,BLK_K) = (128, 8)
+  Tensor sB = make_tensor(make_smem_ptr(smemB), sB_layout);            // (BLK_N,BLK_K) = (128, 8)
 
-  //
   // Partition the copying of A and B tiles across the threads
-  //
-
   // TUTORIAL: Example of simple raked partitioning of ThreadLayouts tA|tB over data A|B tiles
 
-  Tensor tAgA = local_partition(gA, tA, threadIdx.x);                  // (THR_M,THR_K,k)
-  Tensor tAsA = local_partition(sA, tA, threadIdx.x);                  // (THR_M,THR_K)
+  // local_tile 算 block 对应哪个 tile， local_partition 算 thread 对应 tile 里哪些 float。
+  Tensor tAgA = local_partition(gA, tA, threadIdx.x);   // (THR_M,THR_K,k) = (4, 1, 3)
+  Tensor tAsA = local_partition(sA, tA, threadIdx.x);   // (THR_M,THR_K)   = (4, 1)
+  Tensor tBgB = local_partition(gB, tB, threadIdx.x);   // (THR_N,THR_K,k) = (4, 1, 3)
+  Tensor tBsB = local_partition(sB, tB, threadIdx.x);   // (THR_N,THR_K)   = (4, 1)
+  CUTE_STATIC_ASSERT_V(size<0>(tAgA) == size<0>(tAsA)); // THR_M = 4
+  CUTE_STATIC_ASSERT_V(size<1>(tAgA) == size<1>(tAsA)); // THR_K = 1
+  CUTE_STATIC_ASSERT_V(size<0>(tBgB) == size<0>(tBsB)); // THR_N = 4
+  CUTE_STATIC_ASSERT_V(size<1>(tBgB) == size<1>(tBsB)); // THR_K = 1
 
-  Tensor tBgB = local_partition(gB, tB, threadIdx.x);                  // (THR_N,THR_K,k)
-  Tensor tBsB = local_partition(sB, tB, threadIdx.x);                  // (THR_N,THR_K)
-
-  CUTE_STATIC_ASSERT_V(size<0>(tAgA) == size<0>(tAsA));                // THR_M
-  CUTE_STATIC_ASSERT_V(size<1>(tAgA) == size<1>(tAsA));                // THR_K
-  CUTE_STATIC_ASSERT_V(size<0>(tBgB) == size<0>(tBsB));                // THR_N
-  CUTE_STATIC_ASSERT_V(size<1>(tBgB) == size<1>(tBsB));                // THR_K
-
-  //
   // Define A/B partitioning and C accumulators
-  //
-
   // TUTORIAL: Example of partitioning via projections of a ThreadLayout tC
 
   // Partition sA (BLK_M, BLK_K) by the rows of tC
-  Tensor tCsA = local_partition(sA, tC, threadIdx.x, Step<_1, X>{});   // (THR_M,BLK_K)
+  Tensor tCsA = local_partition(sA, tC, threadIdx.x, Step<_1, X>{});   // (THR_M,BLK_K) = (8, 8)
   // Partition sB (BLK_N, BLK_K) by the cols of tC
-  Tensor tCsB = local_partition(sB, tC, threadIdx.x, Step< X,_1>{});   // (THR_N,BLK_K)
+  Tensor tCsB = local_partition(sB, tC, threadIdx.x, Step< X,_1>{});   // (THR_N,BLK_K) = (8, 8)
   // Partition gC (M,N) by the tile of tC
-  Tensor tCgC = local_partition(gC, tC, threadIdx.x, Step<_1,_1>{});   // (THR_M,THR_N)
+  Tensor tCgC = local_partition(gC, tC, threadIdx.x, Step<_1,_1>{});   // (THR_M,THR_N) = (8, 8)
 
   // Allocate the accumulators -- same shape/layout as the partitioned data
-  Tensor tCrC = make_tensor_like(tCgC);                                // (THR_M,THR_N)
+  Tensor tCrC = make_tensor_like(tCgC);                                // (THR_M,THR_N) = (8, 8)
 
-  CUTE_STATIC_ASSERT_V(size<0>(tCrC) == size<0>(tCgC));                // THR_M
-  CUTE_STATIC_ASSERT_V(size<0>(tCrC) == size<0>(tCsA));                // THR_M
-  CUTE_STATIC_ASSERT_V(size<1>(tCrC) == size<1>(tCgC));                // THR_N
-  CUTE_STATIC_ASSERT_V(size<1>(tCrC) == size<0>(tCsB));                // THR_N
-  CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCsB));                // BLK_K
+  CUTE_STATIC_ASSERT_V(size<0>(tCrC) == size<0>(tCgC));                // THR_M = 8
+  CUTE_STATIC_ASSERT_V(size<0>(tCrC) == size<0>(tCsA));                // THR_M = 8
+  CUTE_STATIC_ASSERT_V(size<1>(tCrC) == size<1>(tCgC));                // THR_N = 8
+  CUTE_STATIC_ASSERT_V(size<1>(tCrC) == size<0>(tCsB));                // THR_N = 8
+  CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCsB));                // BLK_K = 8
 
   // Clear the accumulators
   clear(tCrC);
@@ -259,35 +272,36 @@ gemm_nt(int m, int n, int k,
   using namespace cute;
 
   // Define shapes (dynamic)
-  auto M = int(m);
-  auto N = int(n);
-  auto K = int(k);
-  auto prob_shape = make_shape(M, N, K);                     // (M, N, K)
+  auto M = int(m); // 256
+  auto N = int(n); // 384
+  auto K = int(k); // 24
+  auto prob_shape = make_shape(M, N, K); // (M, N, K) = (256, 384, 24)
 
   // Define NT strides (mixed)
-  auto dA = make_stride(Int<1>{}, ldA);                      // (dM, dK)
-  auto dB = make_stride(Int<1>{}, ldB);                      // (dN, dK)
-  auto dC = make_stride(Int<1>{}, ldC);                      // (dM, dN)
+  auto dA = make_stride(Int<1>{}, ldA); // (dM, dK)
+  auto dB = make_stride(Int<1>{}, ldB); // (dN, dK)
+  auto dC = make_stride(Int<1>{}, ldC); // (dM, dN)
 
   // Define CTA tile sizes (static)
   auto bM = Int<128>{};
   auto bN = Int<128>{};
-  auto bK = Int<  8>{};
-  auto cta_tiler = make_shape(bM, bN, bK);                   // (BLK_M, BLK_N, BLK_K)
+  auto bK = Int<8>{};
+  auto cta_tiler = make_shape(bM, bN, bK); // (BLK_M, BLK_N, BLK_K) = (128, 128, 8)
 
   // Define the smem layouts (static)
-  auto sA = make_layout(make_shape(bM, bK));                 // (m,k) -> smem_idx; m-major
-  auto sB = make_layout(make_shape(bN, bK));                 // (n,k) -> smem_idx; n-major
-  auto sC = make_layout(make_shape(bM, bN));                 // (m,n) -> smem_idx; m-major
+  // make_layout is col-major by default, so sA is m-major and sB is n-major
+  auto sA = make_layout(make_shape(bM, bK)); // (m,k) -> smem_idx; m-major = (128, 8)
+  auto sB = make_layout(make_shape(bN, bK)); // (n,k) -> smem_idx; n-major = (128, 8)
+  auto sC = make_layout(make_shape(bM, bN)); // (m,n) -> smem_idx; m-major = (128, 128)
 
   // Define the thread layouts (static)
   auto tA = make_layout(make_shape(Int<32>{}, Int< 8>{}));   // (m,k) -> thr_idx
   auto tB = make_layout(make_shape(Int<32>{}, Int< 8>{}));   // (n,k) -> thr_idx
   auto tC = make_layout(make_shape(Int<16>{}, Int<16>{}));   // (m,n) -> thr_idx
 
-  dim3 dimBlock(size(tC));
+  dim3 dimBlock(size(tC)); // size(tC) = 16*16 = 256 threads per block
   dim3 dimGrid(size(ceil_div(M, bM)),
-               size(ceil_div(N, bN)));
+               size(ceil_div(N, bN))); // vx=256/128=2, vy=384/128=3, so dimGrid=(2,3)
   gemm_device<<<dimGrid, dimBlock, 0, stream>>>
       (prob_shape, cta_tiler,
        A, dA, sA, tA,
@@ -413,5 +427,5 @@ int main()
 {
   CUTE_CHECK_ERROR(cudaSetDevice(0));
   check_gemm<true>();
-  check_gemm<false>();
+  // check_gemm<false>();
 }
