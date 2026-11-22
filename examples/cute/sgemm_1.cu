@@ -146,12 +146,17 @@ gemm_device(ProblemShape shape_MNK,// (256, 384, 24)
 
   // Define A/B partitioning and C accumulators
   // TUTORIAL: Example of partitioning via projections of a ThreadLayout tC
-
-  // Partition sA (BLK_M, BLK_K) by the rows of tC
+  /*
+   * select<0>(tC) = (16,):(1,) 
+   * sA = (128, 8):(1,128)
+   * 按照 dim 0 去分，得到了 (8,8)
+  
+   * select<1>(tC) = (16,):(16,)
+   * sB = (128, 8):(1,128)
+   * 按照 **dim 0** 去分，得到了 (8,8)
+   */
   Tensor tCsA = local_partition(sA, select<0>(tC), threadIdx.x);       // (THR_M,BLK_K) = (8, 8)
-  // Partition sB (BLK_N, BLK_K) by the cols of tC
   Tensor tCsB = local_partition(sB, select<1>(tC), threadIdx.x);       // (THR_N,BLK_K) = (8, 8)
-  // Partition gC (M,N) by the tile of tC
   Tensor tCgC = local_partition(gC, tC, threadIdx.x);                  // (THR_M,THR_N) = (8, 8)
 
   // Allocate the accumulators -- same shape/layout as the partitioned data
