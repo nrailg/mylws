@@ -251,9 +251,7 @@ gemm_device(ProblemShape shape_MNK,// (256, 384, 24)
   //
   // Epilogue
   //
-
   axpby(alpha, tCrC, beta, tCgC);
-
   // TUTORIAL: The above call to axpby(alpha, tCrC, beta, tCgC) is equivalent to
   //   CUTE_UNROLL
   //   for (int i = 0; i < size(tCrC); ++i) {
@@ -315,59 +313,6 @@ gemm_nt(int m, int n, int k,
        alpha, beta);
 }
 
-// Setup params for a TN GEMM
-// Use k-major smem sA and sB, and k-major threads tA|tB
-template <class TA, class TB, class TC,
-          class Alpha, class Beta>
-void
-gemm_tn(int m, int n, int k,
-        Alpha alpha,
-        TA const* A, int ldA,
-        TB const* B, int ldB,
-        Beta beta,
-        TC      * C, int ldC,
-        cudaStream_t stream = 0)
-{
-  using namespace cute;
-
-  // Define shapes (dynamic)
-  auto M = int(m);
-  auto N = int(n);
-  auto K = int(k);
-  auto prob_shape = make_shape(M, N, K);                     // (M, N, K)
-
-  // Define TN strides (mixed)
-  auto dA = make_stride(ldA, Int<1>{});                      // (dM, dK)
-  auto dB = make_stride(ldB, Int<1>{});                      // (dN, dK)
-  auto dC = make_stride(Int<1>{}, ldC);                      // (dM, dN)
-
-  // Define CTA tile sizes (static)
-  auto bM = Int<128>{};
-  auto bN = Int<128>{};
-  auto bK = Int<  8>{};
-  auto cta_tiler = make_shape(bM, bN, bK);                   // (BLK_M, BLK_N, BLK_K)
-
-  // Define the smem layouts (static)
-  auto sA = make_layout(make_shape(bM,bK), LayoutRight{});   // (m,k) -> smem_idx; k-major
-  auto sB = make_layout(make_shape(bN,bK), LayoutRight{});   // (n,k) -> smem_idx; k-major
-  auto sC = make_layout(make_shape(bM, bN));                 // (m,n) -> smem_idx; m-major
-
-  // Define the thread layouts (static)
-  auto tA = make_layout(make_shape(Int<32>{}, Int< 8>{}), LayoutRight{});  // (m,k) -> thr_idx; k-major
-  auto tB = make_layout(make_shape(Int<32>{}, Int< 8>{}), LayoutRight{});  // (n,k) -> thr_idx; k-major
-  auto tC = make_layout(make_shape(Int<16>{}, Int<16>{}));                 // (m,n) -> thr_idx; m-major
-
-  dim3 dimBlock(size(tC));
-  dim3 dimGrid(size(ceil_div(M, bM)),
-               size(ceil_div(N, bN)));
-  gemm_device<<<dimGrid, dimBlock, 0, stream>>>
-      (prob_shape, cta_tiler,
-       A, dA, sA, tA,
-       B, dB, sB, tB,
-       C, dC, sC, tC,
-       alpha, beta);
-}
-
 namespace {
 
 template <bool is_nt>
@@ -397,8 +342,7 @@ void check_gemm()
     gemm_nt(m, n, k, alpha, d_A.data().get(), m, d_B.data().get(), n,
             beta, d_C.data().get(), m);
   } else {
-    gemm_tn(m, n, k, alpha, d_A.data().get(), k, d_B.data().get(), k,
-            beta, d_C.data().get(), m);
+	assert(false);
   }
   CUTE_CHECK_LAST();
   CUTE_CHECK_ERROR(cudaDeviceSynchronize());
@@ -432,5 +376,4 @@ int main()
 {
   CUTE_CHECK_ERROR(cudaSetDevice(0));
   check_gemm<true>();
-  // check_gemm<false>();
 }

@@ -39,3 +39,26 @@ PYTHONPATH=src python -m pytest -q src/my_fp8_quant/test_my_fp8_quant.py
 2026-11-18 在单张 H20 上通过 10 项测试。PyTorch reference 覆盖 batch、非连续输入和边界块，DeepSeek TileKernels 的 `per_block_cast` 用于核对 FP8 编码和两种 scale 模式。验证环境为 PyTorch 2.11.0+cu128、TileLang 0.1.9 和 TileKernels `a9dcaf0`。
 
 GPU 测试日志位于 `$MY_DFS/work/mylws/outputs/my_fp8_quant/20261118/pytest-block128.log`。
+
+## my_chunked_ep
+
+基于 PyTorch all-to-all 的分块专家并行。每个 rank 持有连续的 `num_local_experts` 个专家；先对本地 token 做一次路由，再调用：
+
+```python
+from my_chunked_ep import chunked_ep
+
+output = chunked_ep(hidden, ids, weights, (local_params,), expert_fn,
+                    num_local_experts, group, num_chunks=2)
+```
+
+`hidden` 为浮点 `[N,H]`，`ids` 和 `weights` 为 `[N,K]` 的 int64 全局专家编号和浮点权重。各 rank 的 N 可以不同。各 rank 须使用相同的块数（至少 2）、梯度配置和 collective 调用顺序，包括空块。回调 `expert_fn(rows, local_ids, *parameters)` 接收本 rank 的行及本地专家编号，应支持空输入，返回同形状、同 dtype 的行。训练时使用确定性的可微回调，所有可训练参数显式传入。
+
+每块按目标 rank 打包，提前 dispatch 下一块，在本地计算专家后异步 combine，回到来源 rank 恢复 slot 顺序、乘权重并求和。反向复用同一通信顺序，重算每块专家前向以求一阶梯度。最小实现保留各块返回值，未集成 DeepEP、融合 kernel 或 FSDP。
+
+在两张 CUDA GPU 上运行输出和梯度对照：
+
+```bash
+PYTHONPATH=src torchrun --standalone --nproc-per-node=2 tests/chunked_ep/check_chunked_ep.py
+```
+
+2026-11-22 在单机 2 张 H20（PyTorch 2.11.0+cu128、NCCL）通过 6 组数值对照和 1 项未使用专家参数零梯度回归。FP64 和 BF16 均覆盖不均匀 token 数、空 rank、空块及集中路由；检查输出、输入梯度、路由权重梯度和本地专家参数梯度。
