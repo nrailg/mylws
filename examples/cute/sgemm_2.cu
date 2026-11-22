@@ -29,7 +29,7 @@
  *
  **************************************************************************************************/
 // Kernel and launch configuration from NVIDIA CUTLASS v4.8.1.
-// https://github.com/NVIDIA/cutlass/blob/v4.8.1/examples/cute/tutorial/sgemm_1.cu
+// https://github.com/NVIDIA/cutlass/blob/v4.8.1/examples/cute/tutorial/sgemm_2.cu
 
 #include <cstdio>
 #include <cstdlib>
@@ -42,27 +42,27 @@
 #include <cutlass/util/helper_cuda.hpp>
 
 template <class ProblemShape, class CtaTiler,
-          class TA, class AStride, class ASmemLayout, class AThreadLayout,
-          class TB, class BStride, class BSmemLayout, class BThreadLayout,
-          class TC, class CStride, class CSmemLayout, class CThreadLayout,
+          class TA, class AStride, class ASmemLayout, class TiledCopyA,
+          class TB, class BStride, class BSmemLayout, class TiledCopyB,
+          class TC, class CStride, class CSmemLayout, class TiledMma,
           class Alpha, class Beta>
 __global__ static
-__launch_bounds__(decltype(size(CThreadLayout{}))::value)
+__launch_bounds__(decltype(size(TiledMma{}))::value)
 void
 gemm_device(ProblemShape shape_MNK,// (256, 384, 24)
             CtaTiler cta_tiler,    // (128, 128, 8)
             TA const* A,
             AStride dA,            // (1, 256)
             ASmemLayout sA_layout, // (128, 8), stride (1, 128)
-            AThreadLayout tA,      // (32, 8), stride (1, 32)
+            TiledCopyA copy_a,     // (32, 8) threads, (4, 1) values per thread
             TB const* B,
             BStride dB,            // (1, 384)
             BSmemLayout sB_layout, // (128, 8), stride (1, 128)
-            BThreadLayout tB,      // (32, 8), stride (1, 32)
+            TiledCopyB copy_b,     // (32, 8) threads, (4, 1) values per thread
             TC* C,
             CStride dC,            // (1, 256)
             CSmemLayout,           // (128, 128), stride (1, 128)
-            CThreadLayout tC,      // (16, 16), stride (1, 16)
+            TiledMma mma,          // (16, 16, 1) threads, one scalar FMA per atom
             Alpha alpha,
             Beta beta)
 {
@@ -72,19 +72,8 @@ gemm_device(ProblemShape shape_MNK,// (256, 384, 24)
   CUTE_STATIC_ASSERT_V(rank(shape_MNK) == Int<3>{});                   // (M, N, K) = (256, 384, 24), rank = 3
   CUTE_STATIC_ASSERT_V(rank(cta_tiler) == Int<3>{});                   // (BLK_M, BLK_N, BLK_K) = (128, 128, 8), rank = 3
 
-  static_assert(is_static<AThreadLayout>::value);
-  static_assert(is_static<BThreadLayout>::value);
-  static_assert(is_static<CThreadLayout>::value);
-
-  CUTE_STATIC_ASSERT_V(size(tA) == size(tB));                          // NumThreads = 256
-  CUTE_STATIC_ASSERT_V(size(tC) == size(tA));                          // NumThreads = 256
-
-  CUTE_STATIC_ASSERT_V(size<0>(cta_tiler) % size<0>(tA) == Int<0>{});  // BLK_M / THR_M = 128 / 32 = 4
-  CUTE_STATIC_ASSERT_V(size<2>(cta_tiler) % size<1>(tA) == Int<0>{});  // BLK_K / THR_K = 8 / 8 = 1
-  CUTE_STATIC_ASSERT_V(size<1>(cta_tiler) % size<0>(tB) == Int<0>{});  // BLK_N / THR_N = 128 / 32 = 4
-  CUTE_STATIC_ASSERT_V(size<2>(cta_tiler) % size<1>(tB) == Int<0>{});  // BLK_K / THR_K = 8 / 8 = 1
-  CUTE_STATIC_ASSERT_V(size<0>(cta_tiler) % size<0>(tC) == Int<0>{});  // BLK_M / THR_M = 128 / 16 = 8
-  CUTE_STATIC_ASSERT_V(size<1>(cta_tiler) % size<1>(tC) == Int<0>{});  // BLK_N / THR_N = 128 / 16 = 8
+  CUTE_STATIC_ASSERT_V(size(copy_a) == size(mma));                     // NumThreads = 256
+  CUTE_STATIC_ASSERT_V(size(copy_b) == size(mma));                     // NumThreads = 256
 
   static_assert(is_static<ASmemLayout>::value);
   static_assert(is_static<BSmemLayout>::value);
@@ -132,41 +121,40 @@ gemm_device(ProblemShape shape_MNK,// (256, 384, 24)
   Tensor sB = make_tensor(make_smem_ptr(smemB), sB_layout);            // (BLK_N,BLK_K) = (128, 8)
 
   // Partition the copying of A and B tiles across the threads
-  // TUTORIAL: Example of simple raked partitioning of ThreadLayouts tA|tB over data A|B tiles
+  ThrCopy thr_copy_a = copy_a.get_slice(threadIdx.x);
+  Tensor tAgA = thr_copy_a.partition_S(gA);                            // (CPY,CPY_M,CPY_K,k)
+  Tensor tAsA = thr_copy_a.partition_D(sA);                            // (CPY,CPY_M,CPY_K)
+  Tensor tArA = make_fragment_like(tAsA);                              // (CPY,CPY_M,CPY_K)
 
-  // local_tile 算 block 对应哪个 tile， local_partition 算 thread 对应 tile 里哪些 float。
-  Tensor tAgA = local_partition(gA, tA, threadIdx.x);   // (THR_M,THR_K,k) = (4, 1, 3)
-  Tensor tAsA = local_partition(sA, tA, threadIdx.x);   // (THR_M,THR_K)   = (4, 1)
-  Tensor tBgB = local_partition(gB, tB, threadIdx.x);   // (THR_N,THR_K,k) = (4, 1, 3)
-  Tensor tBsB = local_partition(sB, tB, threadIdx.x);   // (THR_N,THR_K)   = (4, 1)
-  CUTE_STATIC_ASSERT_V(size<0>(tAgA) == size<0>(tAsA)); // THR_M = 4
-  CUTE_STATIC_ASSERT_V(size<1>(tAgA) == size<1>(tAsA)); // THR_K = 1
-  CUTE_STATIC_ASSERT_V(size<0>(tBgB) == size<0>(tBsB)); // THR_N = 4
-  CUTE_STATIC_ASSERT_V(size<1>(tBgB) == size<1>(tBsB)); // THR_K = 1
+  ThrCopy thr_copy_b = copy_b.get_slice(threadIdx.x);
+  Tensor tBgB = thr_copy_b.partition_S(gB);                            // (CPY,CPY_N,CPY_K,k)
+  Tensor tBsB = thr_copy_b.partition_D(sB);                            // (CPY,CPY_N,CPY_K)
+  Tensor tBrB = make_fragment_like(tBsB);                              // (CPY,CPY_N,CPY_K)
+
+  CUTE_STATIC_ASSERT_V(size<1>(tAgA) == size<1>(tAsA));                // CPY_M
+  CUTE_STATIC_ASSERT_V(size<1>(tAgA) == size<1>(tArA));                // CPY_M
+  CUTE_STATIC_ASSERT_V(size<2>(tAgA) == size<2>(tAsA));                // CPY_K
+  CUTE_STATIC_ASSERT_V(size<2>(tAgA) == size<2>(tArA));                // CPY_K
+  CUTE_STATIC_ASSERT_V(size<1>(tBgB) == size<1>(tBsB));                // CPY_N
+  CUTE_STATIC_ASSERT_V(size<1>(tBgB) == size<1>(tBrB));                // CPY_N
+  CUTE_STATIC_ASSERT_V(size<2>(tBgB) == size<2>(tBsB));                // CPY_K
+  CUTE_STATIC_ASSERT_V(size<2>(tBgB) == size<2>(tBrB));                // CPY_K
+
+  // Prefetch the first K tile from global memory into registers.
+  copy(copy_a, tAgA(_,_,_,0), tArA);
+  copy(copy_b, tBgB(_,_,_,0), tBrB);
 
   // Define A/B partitioning and C accumulators
-  // TUTORIAL: Example of partitioning via projections of a ThreadLayout tC
-  /*
-   * select<0>(tC) = (16,):(1,) 
-   * sA = (128, 8):(1,128)
-   * 按照 dim 0 去分，得到了 (8,8)
-  
-   * select<1>(tC) = (16,):(16,)
-   * sB = (128, 8):(1,128)
-   * 按照 **dim 0** 去分，得到了 (8,8)
-   */
-  Tensor tCsA = local_partition(sA, select<0>(tC), threadIdx.x);       // (THR_M,BLK_K) = (8, 8)
-  Tensor tCsB = local_partition(sB, select<1>(tC), threadIdx.x);       // (THR_N,BLK_K) = (8, 8)
-  Tensor tCgC = local_partition(gC, tC, threadIdx.x);                  // (THR_M,THR_N) = (8, 8)
+  ThrMMA thr_mma = mma.get_slice(threadIdx.x);
+  Tensor tCsA = thr_mma.partition_A(sA);                               // (MMA,MMA_M,MMA_K)
+  Tensor tCsB = thr_mma.partition_B(sB);                               // (MMA,MMA_N,MMA_K)
+  Tensor tCgC = thr_mma.partition_C(gC);                               // (MMA,MMA_M,MMA_N)
+  Tensor tCrC = thr_mma.make_fragment_C(tCgC);                         // (MMA,MMA_M,MMA_N)
 
-  // Allocate the accumulators -- same shape/layout as the partitioned data
-  Tensor tCrC = make_tensor_like(tCgC);                                // (THR_M,THR_N) = (8, 8)
-
-  CUTE_STATIC_ASSERT_V(size<0>(tCrC) == size<0>(tCgC));                // THR_M = 8
-  CUTE_STATIC_ASSERT_V(size<0>(tCrC) == size<0>(tCsA));                // THR_M = 8
-  CUTE_STATIC_ASSERT_V(size<1>(tCrC) == size<1>(tCgC));                // THR_N = 8
-  CUTE_STATIC_ASSERT_V(size<1>(tCrC) == size<0>(tCsB));                // THR_N = 8
-  CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCsB));                // BLK_K = 8
+  CUTE_STATIC_ASSERT_V(shape(tCrC) == shape(tCgC));
+  CUTE_STATIC_ASSERT_V(size<1>(tCgC) == size<1>(tCsA));                // MMA_M = 8
+  CUTE_STATIC_ASSERT_V(size<2>(tCgC) == size<1>(tCsB));                // MMA_N = 8
+  CUTE_STATIC_ASSERT_V(size<2>(tCsA) == size<2>(tCsB));                // MMA_K = 8
 
   // Clear the accumulators
   clear(tCrC);
@@ -204,46 +192,21 @@ gemm_device(ProblemShape shape_MNK,// (256, 384, 24)
 
 #if 1
 
-  // TUTORIAL: Example of a simple mainloop that read tiles of data into shared memory,
-  //           and then computes on those tiles.
-  //   copy(.) operates on the global and shared memory via the tA|tB partitioning
-  //   gemm(.) operates on the shared and register memory via the tC partitioning
-
-  auto K_TILE_MAX = size<2>(tAgA);
+  auto K_TILE_MAX = size<3>(tAgA);
 
   for (int k_tile = 0; k_tile < K_TILE_MAX; ++k_tile)
   {
-    // Copy gmem to smem with tA|tB thread-partitioned tensors
-    copy(tAgA(_,_,k_tile), tAsA);      // A   (THR_M,THR_K) -> (THR_M,THR_K)
-    copy(tBgB(_,_,k_tile), tBsB);      // B   (THR_N,THR_K) -> (THR_N,THR_K)
+    __syncthreads();         // Wait for all threads to finish reading the previous tile.
+    copy(tArA, tAsA);
+    copy(tBrB, tBsB);
+    __syncthreads();         // Make the current tile visible to all threads.
 
-    // TUTORIAL: The above call to copy(tAgA(_,_,k_tile), tAsA) is equivalent to
-    //   Tensor tAgAk = tAgA(_,_,k_tile);
-    //   CUTE_UNROLL
-    //   for (int i = 0; i < size(tAsA); ++i) {
-    //     tAsA(i) = tAgAk(i);
-    //   }
+    // Prefetch into registers before computing on the current shared memory tile.
+    int k_tile_next = (k_tile + 1 < K_TILE_MAX) ? k_tile + 1 : k_tile;
+    copy(copy_a, tAgA(_,_,_,k_tile_next), tArA);
+    copy(copy_b, tBgB(_,_,_,k_tile_next), tBrB);
 
-    cp_async_fence();        // Label the end of (potential) cp.async instructions
-    cp_async_wait<0>();      // Sync on all (potential) cp.async instructions
-    __syncthreads();         // Wait for all threads to write to smem
-
-    // Compute gemm on tC thread-partitioned smem
-    gemm(tCsA, tCsB, tCrC);            // (THR_M,THR_N) += (THR_M,BLK_K) * (THR_N,BLK_K)
-
-    // TUTORIAL: The above call to gemm(tCsA, tCsB, tCrC) is equivalent to
-    //   CUTE_UNROLL
-    //   for (int k = 0; k < size<1>(tCsA); ++k) {
-    //     CUTE_UNROLL
-    //     for (int m = 0; m < size<0>(tCrC); ++m) {
-    //       CUTE_UNROLL
-    //       for (int n = 0; n < size<1>(tCrC); ++n) {
-    //         tCrC(m,n) += tCsA(m,k) * tCsB(n,k);
-    //       }
-    //     }
-    //   }
-
-    __syncthreads();         // Wait for all threads to read from smem
+    gemm(mma, tCsA, tCsB, tCrC);
   }
 
 #endif
@@ -260,7 +223,6 @@ gemm_device(ProblemShape shape_MNK,// (256, 384, 24)
 }
 
 // Setup params for an NT GEMM
-// Use m-major smem sA, n-major smem sB, and mn-major threads tA|tB
 template <class TA, class TB, class TC,
           class Alpha, class Beta>
 void
@@ -297,19 +259,23 @@ gemm_nt(int m, int n, int k,
   auto sB = make_layout(make_shape(bN, bK)); // (n,k) -> smem_idx; n-major = (128, 8)
   auto sC = make_layout(make_shape(bM, bN)); // (m,n) -> smem_idx; m-major = (128, 128)
 
-  // Define the thread layouts (static)
-  auto tA = make_layout(make_shape(Int<32>{}, Int< 8>{}));   // (m,k) -> thr_idx
-  auto tB = make_layout(make_shape(Int<32>{}, Int< 8>{}));   // (n,k) -> thr_idx
-  auto tC = make_layout(make_shape(Int<16>{}, Int<16>{}));   // (m,n) -> thr_idx
+  // Each of the 32x8 threads copies four contiguous floats per 128-bit load.
+  TiledCopy copyA = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, TA>{},
+                                    Layout<Shape<_32,_8>>{},
+									Layout<Shape<_4,_1>>{});
+  TiledCopy copyB = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, TB>{},
+                                    Layout<Shape<_32,_8>>{},
+									Layout<Shape<_4,_1>>{});
+  TiledMMA mmaC = make_tiled_mma(UniversalFMA<TC,TA,TB>{}, Layout<Shape<_16,_16,_1>>{});
 
-  dim3 dimBlock(size(tC)); // size(tC) = 16*16 = 256 threads per block
+  dim3 dimBlock(size(mmaC)); // 16*16 = 256 threads per block
   dim3 dimGrid(size(ceil_div(M, bM)),
                size(ceil_div(N, bN))); // vx=256/128=2, vy=384/128=3, so dimGrid=(2,3)
   gemm_device<<<dimGrid, dimBlock, 0, stream>>>
       (prob_shape, cta_tiler,
-       A, dA, sA, tA,
-       B, dB, sB, tB,
-       C, dC, sC, tC,
+       A, dA, sA, copyA,
+       B, dB, sB, copyB,
+       C, dC, sC, mmaC,
        alpha, beta);
 }
 
@@ -361,13 +327,13 @@ void check_gemm()
       const float expected = alpha * dot + beta * initial_c;
       const float actual = h_C[row + col * m];
       if (actual != expected) {
-        std::fprintf(stderr, "sgemm_1 %s C(%d,%d): expected %g, got %g\n",
+        std::fprintf(stderr, "sgemm_2 %s C(%d,%d): expected %g, got %g\n",
                      mode, row, col, expected, actual);
         std::exit(EXIT_FAILURE);
       }
     }
   }
-  std::printf("sgemm_1 %s PASS (M=%d N=%d K=%d)\n", mode, m, n, k);
+  std::printf("sgemm_2 %s PASS (M=%d N=%d K=%d)\n", mode, m, n, k);
 }
 
 }  // namespace
