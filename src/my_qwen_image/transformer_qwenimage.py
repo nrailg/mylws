@@ -21,19 +21,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ...configuration_utils import ConfigMixin, register_to_config
-from ...loaders import FromOriginalModelMixin, PeftAdapterMixin
-from ...utils import apply_lora_scale, logging
-from ...utils.torch_utils import lru_cache_unless_export, maybe_allow_in_graph
-from .._modeling_parallel import ContextParallelInput, ContextParallelOutput
-from ..attention import AttentionMixin, FeedForward
-from ..attention_dispatch import dispatch_attention_fn
-from ..attention_processor import Attention
-from ..cache_utils import CacheMixin
-from ..embeddings import TimestepEmbedding, Timesteps
-from ..modeling_outputs import Transformer2DModelOutput
-from ..modeling_utils import ModelMixin
-from ..normalization import AdaLayerNormContinuous, RMSNorm
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin
+from diffusers.models._modeling_parallel import ContextParallelInput, ContextParallelOutput
+from diffusers.models.attention import AttentionMixin, FeedForward
+from diffusers.models.attention_dispatch import dispatch_attention_fn
+from diffusers.models.attention_processor import Attention
+from diffusers.models.cache_utils import CacheMixin
+from diffusers.models.embeddings import TimestepEmbedding, Timesteps
+from diffusers.models.modeling_outputs import Transformer2DModelOutput
+from diffusers.models.modeling_utils import ModelMixin
+from diffusers.models.normalization import AdaLayerNormContinuous, RMSNorm
+from diffusers.utils import apply_lora_scale, logging
+from diffusers.utils.torch_utils import lru_cache_unless_export, maybe_allow_in_graph
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
