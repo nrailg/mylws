@@ -2,6 +2,45 @@
 
 每个子目录放一个独立的 lib，将 `src` 加入 `PYTHONPATH` 后使用。
 
+## my_fsdp
+
+`MinimalFSDP(block)` 沿第 0 维对每个 dense FP32 可训练参数单独分片。创建 wrapper 时，传入的 block 会注册本 rank 的 shard，所以应在包装之后创建 optimizer。各 rank 使用同样的初始权重，执行相同的 block 调用和梯度路径，各自处理本地 batch。
+
+以下代码在每个 rank 上运行，假设默认 process group 和本 rank 的 `device` 已设置。
+
+```python
+import torch
+from torch import nn
+from my_fsdp import MinimalFSDP
+
+torch.manual_seed(123)
+block = MinimalFSDP(nn.Linear(5, 5).to(device))
+optimizer = torch.optim.AdamW(block.parameters())
+torch.manual_seed(456 + torch.distributed.get_rank())
+h = torch.randn(3, 5, device=device)
+for _ in range(3):
+    h = block(h)
+h.square().mean().backward()
+optimizer.step()
+```
+
+每次调用用 `all_gather_into_tensor` 重建权重，交给 `functional_call` 执行 block，返回时释放完整权重的 storage。进入该次调用的 backward 时，再次 all-gather 到同一块 storage，使 autograd 保存的 weight view 可读。block 的反向计算结束后，每个有梯度的参数执行一次 `reduce_scatter_tensor(SUM)` 并除以 `world_size`。奇数行产生的不等长 shard 只在通信时补齐。[PyTorch FSDP2 关于 storage 和 autograd 的设计说明](https://github.com/pytorch/pytorch/issues/114299)
+
+每个 wrapper 管理一个独立的参数集合，输入和输出各为一个 Tensor。多次调用同一 wrapper 可共享权重和 optimizer state。在同一计算图的 backward 完成后再更新 shard。block 应只读完整权重，对需要梯度的输入使用 out-of-place 运算。像 `Embedding(max_norm=...)` 这样的原地权重更新会触发断言。`Embedding(sparse=True)` 的梯度会转为 dense 再通信。此版本使用同步 collective 和一阶 autograd，跨 wrapper 的 tied weights、mixed precision、通信合并、prefetch 和 checkpoint 存取不在范围内。
+
+### 验证
+
+测试自行启动两个 rank。两者输入不同，分别与 DDP 对照 1 轮和 3 轮调用的输出、输入梯度、参数梯度及两次 AdamW 更新和动量。同时检查通信次数、forward 调用次数、完整权重的 storage 大小，以及 Embedding 的稀疏梯度和原地修改限制。
+
+```bash
+# macOS，两个 CPU 进程
+GLOO_SOCKET_IFNAME=lo0 PYTHONPATH=src python -m pytest -q tests/my_fsdp
+# Linux，同一节点上的两张 CUDA GPU
+CUDA_VISIBLE_DEVICES=0,1 MY_FSDP_TEST_BACKEND=nccl PYTHONPATH=src python -m pytest -q tests/my_fsdp
+```
+
+2026-11-23 在 macOS（PyTorch 2.15.0，Gloo）及双 RTX PRO 5000 Blackwell（PyTorch 2.11.0+cu128，NCCL）上均通过 3 项测试。GPU 日志位于 `$MY_DFS/work/mylws/outputs/my_fsdp/20261123-full-shard.iFDt85/pytest.log`。
+
 ## my_gemm
 
 `from my_gemm import my_gemm`，调用 `C = my_gemm(A, B)` 计算 `A @ B`。输入为同一 CUDA 设备上的 BF16 矩阵，形状分别为 `[M, K]` 和 `[K, N]`，输出为 `[M, N]`。三个维度均须大于零，支持非连续输入和尾块。
