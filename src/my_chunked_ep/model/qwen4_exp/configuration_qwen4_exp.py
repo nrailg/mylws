@@ -19,9 +19,10 @@
 # limitations under the License.
 from huggingface_hub.dataclasses import strict
 
-from ...configuration_utils import PreTrainedConfig
-from ...modeling_rope_utils import RopeParameters
-from ...utils import auto_docstring
+# mylws 从 Transformers 导入配置基类，本文件提供本地 Qwen4-Exp 配置。
+from transformers.configuration_utils import PreTrainedConfig
+from transformers.modeling_rope_utils import RopeParameters
+from transformers.utils import auto_docstring
 
 
 @auto_docstring(checkpoint="Qwen/Qwen4-Exp")

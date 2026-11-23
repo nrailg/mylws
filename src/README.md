@@ -42,23 +42,12 @@ GPU 测试日志位于 `$MY_DFS/work/mylws/outputs/my_fp8_quant/20261118/pytest-
 
 ## my_chunked_ep
 
-基于 PyTorch all-to-all 的分块专家并行。每个 rank 持有连续的 `num_local_experts` 个专家；先对本地 token 做一次路由，再调用：
+本地 Qwen4-Exp 源码来自 Transformers v5.24.0。[上游发布源码](https://github.com/huggingface/transformers/tree/v5.24.0/src/transformers/models/qwen4_exp)
 
-```python
-from my_chunked_ep import chunked_ep
-
-output = chunked_ep(hidden, ids, weights, (local_params,), expert_fn,
-                    num_local_experts, group, num_chunks=2)
-```
-
-`hidden` 为浮点 `[N,H]`，`ids` 和 `weights` 为 `[N,K]` 的 int64 全局专家编号和浮点权重。各 rank 的 N 可以不同。各 rank 须使用相同的块数（至少 2）、梯度配置和 collective 调用顺序，包括空块。回调 `expert_fn(rows, local_ids, *parameters)` 接收本 rank 的行及本地专家编号，应支持空输入，返回同形状、同 dtype 的行。训练时使用确定性的可微回调，所有可训练参数显式传入。
-
-每块按目标 rank 打包，提前 dispatch 下一块，在本地计算专家后异步 combine，回到来源 rank 恢复 slot 顺序、乘权重并求和。反向复用同一通信顺序，重算每块专家前向以求一阶梯度。最小实现保留各块返回值，未集成 DeepEP、融合 kernel 或 FSDP。
-
-在两张 CUDA GPU 上运行输出和梯度对照：
+`bench.py` 分别从本地目录和已安装的 `transformers==5.24.0` 导入模型与配置。两边各构造一层含 indexed attention 和 top-2 MoE 的 `Qwen4ExpForCausalLM`，将官方模型的随机权重完整载入本地模型，用同一批 token 做前向。下面的命令在单张 CUDA GPU 上运行。
 
 ```bash
-PYTHONPATH=src torchrun --standalone --nproc-per-node=2 tests/chunked_ep/check_chunked_ep.py
+python src/my_chunked_ep/model/qwen4_exp/bench.py
 ```
 
-2026-11-22 在单机 2 张 H20（PyTorch 2.11.0+cu128、NCCL）通过 6 组数值对照和 1 项未使用专家参数零梯度回归。FP64 和 BF16 均覆盖不均匀 token 数、空 rank、空块及集中路由；检查输出、输入梯度、路由权重梯度和本地专家参数梯度。
+2026-11-22 在 H20、PyTorch 2.11.0+cu128 上通过。输出形状为 `[2, 8, 128]`，将每个 BF16 logit 的原始 16 位作为 `int16` 对比，2,048 个 logit 中差异为 0。[对拍代码](my_chunked_ep/model/qwen4_exp/bench.py)

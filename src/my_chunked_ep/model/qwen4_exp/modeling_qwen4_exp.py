@@ -27,20 +27,21 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ... import initialization as init
-from ...activations import ACT2FN
-from ...cache_utils import Cache, DynamicCache
-from ...generation import GenerationMixin
-from ...integrations import (
+# mylws 使用 Transformers 的公共组件和同目录的 Qwen4-Exp 配置。
+from transformers import initialization as init
+from transformers.activations import ACT2FN
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.generation import GenerationMixin
+from transformers.integrations import (
     use_experts_implementation,
     use_kernel_forward_from_hub,
     use_kernel_func_from_hub_with_fallback,
     use_kernelized_func,
 )
-from ...integrations.accelerate import force_accelerate_hooks
-from ...masking_utils import create_causal_mask, create_recurrent_attention_mask
-from ...modeling_layers import GradientCheckpointingLayer
-from ...modeling_outputs import (
+from transformers.integrations.accelerate import force_accelerate_hooks
+from transformers.masking_utils import create_causal_mask, create_recurrent_attention_mask
+from transformers.modeling_layers import GradientCheckpointingLayer
+from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     BaseModelOutputWithPooling,
     MoeCausalLMOutputWithPast,
@@ -48,10 +49,11 @@ from ...modeling_outputs import (
     MultimodalMoeBaseModelOutputWithPast,
     MultimodalMoeCausalLMOutputWithPast,
 )
-from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel, slice_logits_to_keep
-from ...processing_utils import Unpack
-from ...utils import (
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel, slice_logits_to_keep
+from transformers.models.auto import AutoModel
+from transformers.processing_utils import Unpack
+from transformers.utils import (
     TransformersKwargs,
     auto_docstring,
     can_return_tuple,
@@ -59,21 +61,24 @@ from ...utils import (
     logging,
     torch_compilable_check,
 )
-from ...utils.deprecation import deprecate_kwarg
-from ...utils.generic import (
+from transformers.utils.deprecation import deprecate_kwarg
+from transformers.utils.generic import (
     accepts_precomputed_kwargs,
     get_max_seqlen,
     is_flash_attention_requested,
     merge_with_config_defaults,
 )
-from ...utils.output_capturing import OutputRecorder, capture_outputs
-from ...vision_utils import (
+from transformers.utils.output_capturing import OutputRecorder, capture_outputs
+from transformers.vision_utils import (
     get_vision_attention_seqlens,
     get_vision_interpolation_indices_and_weights,
     get_vision_position_ids,
 )
-from ..auto import AutoModel
-from .configuration_qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig, Qwen4ExpVisionConfig
+
+if __package__:
+    from .configuration_qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig, Qwen4ExpVisionConfig
+else:  # 直接运行同目录的 bench.py。
+    from configuration_qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig, Qwen4ExpVisionConfig
 
 
 logger = logging.get_logger(__name__)
