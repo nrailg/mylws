@@ -3,7 +3,7 @@
 CuTe 用 `Layout` 描述坐标到 offset 的映射，再用 `Tensor` 将映射应用到数据。
 这组例子从手写索引开始，逐步走到 tile、thread partition 和 layout algebra；每个 `.cpp` 都有独立的 `main()`。
 
-- `t01` 到 `t09` 在 **host CPU** 上执行。[sgemm_1](#sgemm_1cuda-gemm) 需要一张 CUDA GPU。
+- `t01` 到 `t09` 在 **host CPU** 上执行。[sgemm_1](#sgemm_1cuda-gemm) 需要一张 CUDA GPU，[wgmma_tma_sm90](#wgmma_tma_sm90) 需要一张 Hopper GPU。
 - 编译仍需要 CUTLASS 和 CUDA Toolkit headers；这组依赖按 CUTLASS **v4.8.1** 固定。
 - CPU 例子先手算输出，再运行核对。断言通过时打印 `tXX PASS`。不要加 `-DNDEBUG`。
 
@@ -231,6 +231,30 @@ make -C examples/cute check-gpu
 CUTLASS v4.8.1 运行 `check-gpu CUDA_ARCH=sm_90`。在临时测试副本中启用 TN 后，
 `sgemm_1 NT PASS` 和 `sgemm_1 TN PASS` 均通过，退出码为 0。
 日志位于 Gemini 项目目录的 `outputs/cute/20261121-sgemm-select/check-gpu.log`。
+
+## wgmma_tma_sm90
+
+[wgmma_tma_sm90.cu](wgmma_tma_sm90.cu) 用 TMA 把 A 和 B 异步搬到 shared memory 中的三段
+pipeline，warpgroup 等待对应的 barrier 后用 WGMMA 累加 FP16 GEMM。源自
+[NVIDIA CUTLASS v4.2.1 的 Hopper 教程](https://github.com/NVIDIA/cutlass/blob/v4.2.1/examples/cute/tutorial/hopper/wgmma_tma_sm90.cu)。
+
+沿用上面的 `CUTLASS_DIR` 和 `CUDA_HOME`，在一张 Hopper GPU（如 H20 或 H100）上运行。
+Makefile 以 `sm_90a` 编译此例。
+
+```bash
+make -C examples/cute check-wgmma-tma
+```
+
+命令用 `(M, N, K) = (512, 256, 1024)` 分别运行 NT 和 TN，逐元素核对 CPU reference，
+每种布局通过时打印 `wgmma_tma_sm90 ... PASS`，随后打印计时。
+单独编译可用 `make -C examples/cute ../../outputs/cute/build/wgmma_tma_sm90`。
+可执行文件接受 `M N K N T` 或 `M N K T N`。完整 CTA tile 和 cluster 要求
+`M`、`N`、`K` 分别为 256、128、64 的正整数倍。输入为 ±1，`K <= 2048` 时做精确校验。
+
+2026-11-23 在单节点 Gemini 的 NVIDIA H20 上用 CUDA 12.8.93、GCC 12.3 和 CUTLASS v4.8.1
+运行 `check-wgmma-tma`。默认形状和 `(256, 128, 64)` 的 NT、TN 逐元素校验均通过，
+退出码为 0。未对齐的 `M=128` 返回退出码 1。
+日志位于 Gemini 项目目录的 `outputs/cute/20261123-wgmma-tma.954Uam/check-wgmma-tma.log`。
 
 ## 后续衔接
 
