@@ -16,8 +16,8 @@ _BLOCK_M, _BLOCK_N, _BLOCK_K = 64, 64, 32
 
 @tilelang.jit(pass_configs={"tl.disable_tma_lower": True, "tl.disable_warp_specialized": True})
 def _grouped_m_kernel(a, b, sizes, starts, padded_starts, transpose_b: bool):
-    M, E = T.dynamic("M, E", T.int32)
-    K, N = T.const("K, N")
+    M = T.dynamic("M", T.int32)
+    E, K, N = T.const("E, K, N")
     BM, BN, BK = _BLOCK_M, _BLOCK_N, _BLOCK_K
     a: T.Tensor((M, K), T.bfloat16)
     b: T.Tensor((E, N, K) if transpose_b else (E, K, N), T.bfloat16)
@@ -59,8 +59,8 @@ def _grouped_m_kernel(a, b, sizes, starts, padded_starts, transpose_b: bool):
 
 @tilelang.jit(pass_configs={"tl.disable_tma_lower": True, "tl.disable_warp_specialized": True})
 def _grouped_k_kernel(a, dc, sizes, starts):
-    M, E = T.dynamic("M, E", T.int32)
-    K, N = T.const("K, N")
+    M = T.dynamic("M", T.int32)
+    E, K, N = T.const("E, K, N")
     BM, BN, BK = _BLOCK_M, _BLOCK_N, _BLOCK_K
     a: T.Tensor((M, K), T.bfloat16)
     dc: T.Tensor((M, N), T.bfloat16)

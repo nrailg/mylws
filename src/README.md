@@ -53,7 +53,7 @@ TileLang NN kernel 用 `T.dynamic` 声明 `M`、`N`、`K`，不同形状复用�
 
 `offs` 是同一设备上长度为 `E` 的连续 `int32` tensor，记录每组的累计结束位置。全部输入行都属于某个 expert，要求 `offs[-1] == T`。例如 `[2, 2, 6, 8]` 给 4 个 expert 分别分配 2、0、4、2 行。空组的权重梯度为零。
 
-前向和 `dX` 沿输出的 M、N 两维切成 `64 × 64` 的 tile。前向在 GPU 上从 `offs` 算出各 expert 的行数、起点和对齐后的起点，`dX` 复用这些 metadata。kernel 按对齐后的起点找到 M tile 所属的 expert。JIT 按特征宽度编译，token 数和 expert 数在运行时传入。
+前向和 `dX` 沿输出的 M、N 两维切成 `64 × 64` 的 tile。前向在 GPU 上从 `offs` 算出各 expert 的行数、起点和对齐后的起点，`dX` 复用这些 metadata。kernel 按对齐后的起点找到 M tile 所属的 expert。JIT 按 expert 数和特征宽度编译，token 数在运行时传入。
 
 Qwen3.8-Flash-Next 的 expert 权重 `W` 按 `[E, D_o, D_i]` 存储。`gate_up_proj` 为 `[512, 1280, 2560]`，`down_proj` 为 `[512, 2560, 640]`。[模型定义](my_chunked_ep/model/qwen4_exp/modeling_qwen4_exp.py#L940-L972) · [Checkpoint 配置](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/812d96e10a0dd82b69d749e68693698cf6c36daa/config.json)
 
@@ -76,7 +76,7 @@ PYTHONPATH=src python -m pytest -q tests/my_gemm
 
 2026-11-23 在单张 RTX PRO 5000 Blackwell（SM120）上，修正归约尾块的 mask 后，移植版和简化版各通过 8 项测试。用逐 expert 的 CPU FP32 Linear 核对输出、`dX` 和 `dW`，另测了特征尾块、首尾空组以及特征宽度相同时的不同 token 数。
 
-验证环境为 PyTorch `2.11.0+cu128`、TileLang `0.1.9`、apache-tvm-ffi `0.1.8.post2`。日志位于 `$MY_DFS/work/mylws/outputs/my_gemm/20261123-grouped-port.wMXPBH/simplified.log`。
+验证环境为 PyTorch `2.11.0+cu128`、TileLang `0.1.9`、apache-tvm-ffi `0.1.8.post2`。日志位于 `$MY_DFS/work/mylws/outputs/my_gemm/20261123-grouped-port.wMXPBH/expert-const.log`。
 
 ## myfa
 
