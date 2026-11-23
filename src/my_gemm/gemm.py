@@ -59,6 +59,9 @@ class _Gemm(torch.autograd.Function):
     def backward(
         ctx: FunctionCtx, dc: torch.Tensor
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        # md $$C = AB$$
+        # md $$\nabla_A = \nabla_C B^\top$$
+        # md $$\nabla_B = A^\top \nabla_C$$
         a, b = ctx.saved_tensors
         da = _gemm_nn(dc, b.T) if ctx.needs_input_grad[0] else None
         db = _gemm_nn(a.T, dc) if ctx.needs_input_grad[1] else None
