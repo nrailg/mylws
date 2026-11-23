@@ -49,11 +49,15 @@ TileLang NN kernel 用 `T.dynamic` 声明 `M`、`N`、`K`，不同形状复用�
 
 ### my_grouped_mm
 
-`my_grouped_mm(mat_a, mat_b, *, offs)` 接受按 expert 排列的输入 `[T, D_i]` 和右操作数 `[E, D_i, D_o]`。对 expert `g` 的 token 行 `s:e`，forward 计算 `mat_a[s:e] @ mat_b[g]`，输出形状为 `[T, D_o]`。输入与输出均为 CUDA BF16，kernel 使用 FP32 累加，支持一阶 autograd。输出采用普通 `T.Tensor`，由 TileLang 的 `out_idx` 分配。[PyTorch grouped_mm 接口](https://docs.pytorch.org/docs/2.15/generated/torch.nn.functional.grouped_mm.html) · [TileLang 0.1.9 grouped GEMM 示例](https://github.com/tile-ai/tilelang/blob/v0.1.9/examples/grouped_gemm/example_grouped_gemm_fwd.py#L39-L86)
+`my_grouped_mm(mat_a, mat_b, *, offs)` 接受按 expert 排列的输入 `[T, D_i]` 和右操作数 `[E, D_i, D_o]`。对 expert `g` 的 token 行 `s:e`，forward 计算 `mat_a[s:e] @ mat_b[g]`，输出形状为 `[T, D_o]`。输入与输出均为 CUDA BF16，kernel 使用 FP32 累加，支持一阶 autograd。TileLang 用 `T.empty` 分配输出。[PyTorch grouped_mm 接口](https://docs.pytorch.org/docs/2.15/generated/torch.nn.functional.grouped_mm.html) · [TileLang grouped GEMM 示例](https://github.com/tile-ai/tilelang/blob/3f01780f093cc5f6691d106da287a0eeb8e51ad3/examples/grouped_gemm/example_grouped_gemm_bwd.py)
 
-`offs` 是同一设备上长度为 `E` 的连续 `int32` tensor，记录每组的累计结束位置。例如 `[2, 2, 6, 8]` 给 4 个 expert 分别分配 2、0、4、2 行。未分配的尾部输出行及其输入梯度为零，空组的权重梯度为零。入口检查 offset 的范围和顺序时会同步一次 CUDA。
+`offs` 是同一设备上长度为 `E` 的连续 `int32` tensor，记录每组的累计结束位置。全部输入行都属于某个 expert，要求 `offs[-1] == T`。例如 `[2, 2, 6, 8]` 给 4 个 expert 分别分配 2、0、4、2 行。空组的权重梯度为零。
 
-Qwen3.8-Flash-Next 的 expert 权重 `W` 按 `[E, D_o, D_i]` 存储。`gate_up_proj` 为 `[512, 1280, 2560]`，`down_proj` 为 `[512, 2560, 640]`。forward 传入 `W.mT`，计算 `dX` 时传入 `W`。同一个 kernel 按右操作数的实际步长读取这两种视图，两次乘法共用权重存储。[模型定义](my_chunked_ep/model/qwen4_exp/modeling_qwen4_exp.py#L940-L972) · [Checkpoint 配置](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/812d96e10a0dd82b69d749e68693698cf6c36daa/config.json)
+前向和 `dX` 沿输出的 M、N 两维切成 `64 × 64` 的 tile。前向在 GPU 上从 `offs` 算出各 expert 的行数、起点和对齐后的起点，`dX` 复用这些 metadata。kernel 按对齐后的起点找到 M tile 所属的 expert。JIT 按特征宽度编译，token 数和 expert 数在运行时传入。
+
+Qwen3.8-Flash-Next 的 expert 权重 `W` 按 `[E, D_o, D_i]` 存储。`gate_up_proj` 为 `[512, 1280, 2560]`，`down_proj` 为 `[512, 2560, 640]`。[模型定义](my_chunked_ep/model/qwen4_exp/modeling_qwen4_exp.py#L940-L972) · [Checkpoint 配置](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/812d96e10a0dd82b69d749e68693698cf6c36daa/config.json)
+
+调用方传入 `B = W.mT` 时，入口用 `.contiguous()` 将这个转置视图复制一次。求 `dX` 时复用这份连续的 `B`，用 `T.gemm` 的 `transpose_B=True` 计算 `dY @ B.T`。权重梯度 kernel 在各 expert 的 token 归约尾块补零，直接输出 `dB = X.T @ dY`，PyTorch autograd 再将梯度传给 `W`。
 
 ```python
 from my_gemm import my_grouped_mm
@@ -70,9 +74,9 @@ y.backward(dy)  # x.grad [T, D_i]，W.grad [E, D_o, D_i]
 PYTHONPATH=src python -m pytest -q tests/my_gemm
 ```
 
-2026-11-23 在单张 RTX PRO 5000 Blackwell（SM120）上通过 8 项测试，含原有 4 项 GEMM 测试。4 项 grouped_mm 用例均使用 4 个 expert，`D_i`、`D_o` 取 2 的幂。测试用逐 expert 的 CPU FP32 Linear 核对输出、`dX` 和 `dW`，覆盖不等长分组、空组和未用尾部。另与 CUDA 上的原生 `torch.nn.functional.grouped_mm` 对拍，三者均在 BF16 容差内一致。
+2026-11-23 在单张 RTX PRO 5000 Blackwell（SM120）上，修正归约尾块的 mask 后，移植版和简化版各通过 8 项测试。用逐 expert 的 CPU FP32 Linear 核对输出、`dX` 和 `dW`，另测了特征尾块、首尾空组以及特征宽度相同时的不同 token 数。
 
-验证环境为 PyTorch `2.11.0+cu128`、TileLang `0.1.9`、apache-tvm-ffi `0.1.8.post2`。pytest 及原生算子对拍日志位于 `$MY_DFS/work/mylws/outputs/my_gemm/20261123-grouped-mm.W5GjMc/verification.log`。
+验证环境为 PyTorch `2.11.0+cu128`、TileLang `0.1.9`、apache-tvm-ffi `0.1.8.post2`。日志位于 `$MY_DFS/work/mylws/outputs/my_gemm/20261123-grouped-port.wMXPBH/simplified.log`。
 
 ## myfa
 
