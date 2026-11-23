@@ -1,4 +1,4 @@
-"""从仓库根目录运行：PYTHONPATH=src python -m pytest src/myfa/test_myfa_varlen_sw_sinks.py -v。"""
+"""从仓库根目录运行 `PYTHONPATH=src python -m pytest -v tests/myfa/test_myfa_varlen_sw_sinks.py`。"""
 
 import math
 

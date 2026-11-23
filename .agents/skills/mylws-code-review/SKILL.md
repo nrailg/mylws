@@ -98,7 +98,7 @@ tests/<topic>/       Standalone tests
 .agents/skills/     Development, review, and testing skills for this project
 ```
 
-- Put importable or callable implementations in `src/<topic>/`, standalone programs that explain concepts or demonstrate usage in `examples/<topic>/`, and standalone tests in `tests/<topic>/`. Keep existing tests where they are, such as `src/myfa/test_*.py`.
+- Put importable or callable implementations in `src/<topic>/`, standalone programs that explain concepts or demonstrate usage in `examples/<topic>/`, and standalone tests in `tests/<topic>/`. Keep existing tests where they are.
 - Document `src` interfaces, dependencies, and usage in an existing relevant README, such as `src/README.md`. A separate README for each topic is optional.
 - Apply the following organization rules to `examples/`. Standalone demonstration entry points and example-specific dependency layouts are optional for `src/` modules.
 - Keep each example focused on one question and make it understandable and runnable on its own. Add new examples to the root README.
