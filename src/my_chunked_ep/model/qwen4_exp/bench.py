@@ -1,65 +1,89 @@
+import argparse
+import gc
 from pathlib import Path
 
 import torch
-from transformers import __version__ as transformers_version
-from transformers.models.qwen4_exp import modeling_qwen4_exp as upstream_qwen
+from transformers import PreTrainedModel
+from transformers.conversion_mapping import (
+    get_checkpoint_conversion_mapping,
+    register_checkpoint_conversion_mapping,
+)
+from transformers.models.qwen4_exp import modeling_qwen4_exp as pub_qwen
 
 if __package__:
     from . import modeling_qwen4_exp as local_qwen
-else:
+else:  # 直接执行 bench.py 时，Python 从脚本所在目录导入。
     import modeling_qwen4_exp as local_qwen
 
 
-@torch.inference_mode()
-def main() -> None:
-    local_file = Path(__file__).with_name("modeling_qwen4_exp.py")
-    assert local_file.samefile(local_qwen.__file__)
-    assert not local_file.samefile(upstream_qwen.__file__)
+class LocalQwen4ExpForCausalLM(local_qwen.Qwen4ExpForCausalLM):
+    """用单独的类名为本地实现注册 checkpoint 转换规则。"""
 
-    torch.manual_seed(0)
-    settings = dict(
-        vocab_size=128,
-        hidden_size=64,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=16,
-        layer_types=["indexed_attention"],
-        indexer_n_heads=2,
-        indexer_kv_heads=1,
-        indexer_head_dim=16,
-        indexer_budget=4,
-        indexer_compress_ratio=2,
-        num_experts=4,
-        num_experts_per_tok=2,
-        moe_intermediate_size=48,
-        shared_expert_intermediate_size=32,
-        hc_lowrank=16,
+
+def load_checkpoint(
+    model_class: type[PreTrainedModel], checkpoint: Path, device_map: str | dict
+) -> PreTrainedModel:
+    model, info = model_class.from_pretrained(
+        checkpoint,
+        dtype=torch.bfloat16,
+        device_map=device_map,
         attn_implementation="eager",
         experts_implementation="eager",
-        use_cache=False,
+        local_files_only=True,
+        output_loading_info=True,
     )
-    upstream_config = upstream_qwen.Qwen4ExpTextConfig(**settings)
-    local_config = local_qwen.Qwen4ExpTextConfig(**settings)
-    reference = upstream_qwen.Qwen4ExpForCausalLM(upstream_config).to("cuda", torch.bfloat16).eval()
-    model = local_qwen.Qwen4ExpForCausalLM(local_config).to("cuda", torch.bfloat16).eval()
-    model.load_state_dict(reference.state_dict(), strict=True)
+    assert not any(info.values()), info
+    assert all(p.dtype == torch.bfloat16 for p in model.parameters())
+    return model.eval()
 
-    input_ids = torch.arange(16, device="cuda").reshape(2, 8)
-    logits = model(input_ids=input_ids).logits
-    expected = reference(input_ids=input_ids).logits
 
-    assert logits.shape == expected.shape == (*input_ids.shape, local_config.vocab_size)
-    assert logits.dtype == expected.dtype == torch.bfloat16
-    assert torch.isfinite(logits).all()
+@torch.inference_mode()
+def main(checkpoint: Path) -> None:
+    assert checkpoint.is_dir(), checkpoint
+    local_file = Path(__file__).with_name("modeling_qwen4_exp.py")
+    assert local_file.samefile(local_qwen.__file__)
+    assert not local_file.samefile(pub_qwen.__file__)
+    assert torch.cuda.device_count() > 0
+
+    # Transformers 要求本地类显式注册权重前缀转换和 PLE embedding 分片拼接规则。
+    register_checkpoint_conversion_mapping(
+        LocalQwen4ExpForCausalLM.__name__,
+        get_checkpoint_conversion_mapping(local_qwen.Qwen4ExpTextConfig.model_type),
+        overwrite=True,
+    )
+    input_ids = torch.arange(16).reshape(2, 8)
+    outputs = []
+    device_map = "auto"
+    for model_class in (LocalQwen4ExpForCausalLM, pub_qwen.Qwen4ExpForCausalLM):
+        print(f"Loading {checkpoint.name} with {model_class.__name__}", flush=True)
+        model = load_checkpoint(model_class, checkpoint, device_map)
+        # 复用第一份模型的设备分布，两次前向只保留 CPU 上的 logits。
+        device_map = model.hf_device_map
+        device = model.get_input_embeddings().weight.device
+        logits = model(input_ids=input_ids.to(device), use_cache=False).logits.cpu()
+        assert logits.shape == (*input_ids.shape, model.config.vocab_size)
+        assert logits.dtype == torch.bfloat16 and torch.isfinite(logits).all()
+        outputs.append(logits)
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    logits, expected = outputs
+    assert logits.shape == expected.shape
     # 将 BF16 的原始位模式看作 int16，逐个 logit 比较，包括零的符号位。
     local_bits = logits.contiguous().view(torch.int16)
-    upstream_bits = expected.contiguous().view(torch.int16)
-    mismatches = torch.count_nonzero(local_bits != upstream_bits).item()
+    pub_bits = expected.contiguous().view(torch.int16)
+    mismatches = torch.count_nonzero(local_bits != pub_bits).item()
     assert mismatches == 0, f"{mismatches}/{logits.numel()} BF16 logits differ"
-    print(f"Transformers {transformers_version}, logits {tuple(logits.shape)} on {logits.device}: "
-          f"{mismatches}/{logits.numel()} BF16 bit patterns differ")
+    print(
+        f"{checkpoint.name}, logits {tuple(logits.shape)}: "
+        f"{mismatches}/{logits.numel()} BF16 bit patterns differ"
+    )
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "checkpoint", type=Path, help="Local Qwen4-Exp Hugging Face checkpoint directory"
+    )
+    main(parser.parse_args().checkpoint)

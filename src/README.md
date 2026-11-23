@@ -42,12 +42,14 @@ GPU 测试日志位于 `$MY_DFS/work/mylws/outputs/my_fp8_quant/20261118/pytest-
 
 ## my_chunked_ep
 
-本地 Qwen4-Exp 源码来自 Transformers v5.24.0。[上游发布源码](https://github.com/huggingface/transformers/tree/v5.24.0/src/transformers/models/qwen4_exp)
+本地 Qwen4-Exp 源码来自 Transformers v5.24.0。G-Core 的 chunkedEP 对应 `Qwen/Qwen3.8-Flash-Next`。对拍使用该 checkpoint 的文本模型 `Qwen4ExpForCausalLM`，共 48 层，每层从 512 个专家中选取 10 个。[模型卡](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) · [上游源码](https://github.com/huggingface/transformers/tree/v5.24.0/src/transformers/models/qwen4_exp)
 
-`bench.py` 分别从本地目录和已安装的 `transformers==5.24.0` 导入模型与配置。两边各构造一层含 indexed attention 和 top-2 MoE 的 `Qwen4ExpForCausalLM`，将官方模型的随机权重完整载入本地模型，用同一批 token 做前向。下面的命令在单张 CUDA GPU 上运行。
+`bench.py` 的 `load_checkpoint` 分别用本地实现和官方实现从同一目录加载 BF16 权重。两次前向使用相同的设备分布和 token，依次运行以复用显存，最后逐位比较全部 logits。运行需要 CUDA、PyTorch、`transformers==5.24.0`、Accelerate 及完整的本地 Hugging Face checkpoint。
 
 ```bash
-python src/my_chunked_ep/model/qwen4_exp/bench.py
+python src/my_chunked_ep/model/qwen4_exp/bench.py /path/to/Qwen3.8-Flash-Next
 ```
 
-2026-11-22 在 H20、PyTorch 2.11.0+cu128 上通过。输出形状为 `[2, 8, 128]`，将每个 BF16 logit 的原始 16 位作为 `int16` 对比，2,048 个 logit 中差异为 0。[对拍代码](my_chunked_ep/model/qwen4_exp/bench.py)
+2026-11-23 在一台 8 卡 H20 节点上验证，使用 PyTorch 2.11.0+cu128 和 Accelerate 1.16.0。checkpoint 的配置和权重索引与公开版本 `812d96e` 一致。attention 和 MoE 使用 eager，causal convolution 和 gated delta rule 使用 PyTorch reference。输入形状为 `[2, 8]`，输出形状为 `[2, 8, 248320]`，3,973,120 个 BF16 logits 全部逐位一致。[checkpoint 版本](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/tree/812d96e10a0dd82b69d749e68693698cf6c36daa)
+
+GPU 测试日志位于 `$MY_DFS/work/mylws/outputs/my_chunked_ep/20261123-qwen38-bf16.DoqX9u/forward.log`。

@@ -4,7 +4,7 @@ Lightweight implementations and examples for personal learning.
 
 ## Lightweight Implementations
 
-- [my_chunked_ep](src/README.md#my_chunked_ep) compares the local Qwen4-Exp forward pass with the Transformers release on one GPU.
+- [my_chunked_ep](src/README.md#my_chunked_ep) compares BF16 logits from the local and Transformers implementations of Qwen3.8-Flash-Next.
 - [myfa](src/README.md#myfa): TileLang Flash Attention with fixed-length and variable-length implementations.
 - [my_fp8_quant](src/README.md#my_fp8_quant): 128×128 block-wise FP8 quantization in TileLang.
 
