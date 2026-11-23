@@ -2,6 +2,20 @@
 
 每个子目录放一个独立的 lib，将 `src` 加入 `PYTHONPATH` 后使用。
 
+## my_gemm
+
+`from my_gemm import my_gemm`，调用 `C = my_gemm(A, B)` 计算 `A @ B`。输入为同一 CUDA 设备上的 BF16 矩阵，形状分别为 `[M, K]` 和 `[K, N]`，输出为 `[M, N]`。三个维度均须大于零，支持非连续输入和尾块。
+
+TileLang NN kernel 用 `T.dynamic` 声明 `M`、`N`、`K`，不同形状复用同一份编译结果。forward 计算 `A @ B`，backward 按需计算 `dC @ B.T` 和 `A.T @ dC`，均用 FP32 累加并返回 BF16。每次调用先将操作数转为连续矩阵，再断言首地址和行步长均按 16 字节对齐。对 BF16，forward 要求 `K` 和 `N` 是 8 的倍数，计算 `dB` 时还要求 `M` 是 8 的倍数。
+
+依赖 Python 3.12、PyTorch、TileLang 和 CUDA GPU。测试额外使用 pytest，在仓库根目录运行：
+
+```bash
+PYTHONPATH=src python -m pytest -q tests/my_gemm
+```
+
+2026-11-23 在单张 RTX PRO 5000 Blackwell（SM120）上通过 4 项测试。整块 `(M,N,K) = (256,384,128)` 和尾块 `(136,192,80)` 均用 PyTorch FP32 autograd 核对 forward 输出与两个输入的梯度。另两项分别验证首地址和行步长未对齐时触发断言。验证环境使用 PyTorch `2.11.0+cu128`、TileLang `0.1.9`、apache-tvm-ffi `0.1.8.post2`。日志位于 `$MY_DFS/work/mylws/outputs/my_gemm/20261123/pytest-dynamic-nn-aligned.log`。
+
 ## myfa
 
 从 gcore-dev 的 `gfused/myfa_sw_sinks.py` 和 `gfused/myfa_varlen_sw_sinks.py` 复制的 TileLang Flash Attention，包含 forward、backward、GQA、sliding window 和可选的 attention sinks。kernel 代码保持原样。
