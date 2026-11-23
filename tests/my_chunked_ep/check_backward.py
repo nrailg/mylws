@@ -13,9 +13,9 @@ from torch import Tensor
 from torch.distributed.tensor import DTensor, Shard
 from transformers.models.qwen4_exp import modeling_qwen4_exp as public
 
-from my_chunked_ep.model.qwen4_exp import modeling_qwen4_exp as local
-from my_chunked_ep.model.qwen4_exp.parallel_layers import ParallelExperts
-from my_chunked_ep.model.qwen4_exp.parallel_model import (
+from archived.model.qwen4_exp import modeling_qwen4_exp as local
+from archived.model.qwen4_exp.parallel_layers import ParallelExperts
+from archived.model.qwen4_exp.parallel_model import (
     Parallelism, build_parallel_model, finish_gradients, local_tensor, sequence_logits,
 )
 
