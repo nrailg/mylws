@@ -4,11 +4,12 @@
 
 ## 运行
 
-运行需要 CUDA、PyTorch、Transformers 5.24.0、Accelerate 和完整的 checkpoint。在仓库根目录运行，默认读取节点上的 `/hf-hub/Qwen/Qwen3.8-Flash-Next`。下面的命令只加载第一个 decoder layer 做快速调试。
+运行需要 CUDA、PyTorch、Transformers 5.24.0、Accelerate 和完整的 checkpoint。在单个 launcher 的仓库根目录运行，默认读取节点上的 `/hf-hub/Qwen/Qwen3.8-Flash-Next`。日常对拍保留前 4 层，覆盖第 1～3 层的 GatedDeltaNet 和第 4 层带 QSA indexer 的 indexed attention。
 
 ```bash
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export OMP_NUM_THREADS=12 OPENBLAS_NUM_THREADS=1
-python src/my_chunked_ep/model/qwen4_exp/bench.py --debug-num-layers 1
+python src/my_chunked_ep/model/qwen4_exp/bench.py --debug-num-layers 4
 ```
 
 `--debug-num-layers N` 保留前 N 层及输入、输出权重。第 2 层含约 95 GiB 的 PLE embedding，单层调试会跳过这张表。Transformers 的加载报告会列出被裁掉层的参数，bench 仍会检查所有保留层。省略开关即加载全部 48 层。要复现 CephFS 对照，将 `QWEN_CHECKPOINT` 设为该模型在 CephFS 上的目录。
