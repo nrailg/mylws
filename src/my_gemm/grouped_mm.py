@@ -74,7 +74,7 @@ def _grouped_k_kernel(a, dc, sizes, starts):
         acc = T.alloc_fragment((BM, BN), T.float32)
 
         start = starts[expert]
-        size = sizes[expert]
+        size = sizes[expert] # TODO 这里非常显然有 workload balance 的问题
         row, col = bx * BM, by * BN
         T.clear(acc)
         for k in T.Pipelined(T.ceildiv(size, BK), num_stages=2):
