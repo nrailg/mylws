@@ -139,8 +139,17 @@ def build_parallel_model(
                 ignored.add(table.weight)
 
     if parallel.fsdp:
+        world = parallel.dense.size()
+        use_sum = 1 < parallel.expert_fsdp.size() < world
         for layer in model.model.layers:
-            fully_shard(layer.mlp.experts, mesh=parallel.expert_fsdp, reshard_after_forward=True)
+            experts = fully_shard(
+                layer.mlp.experts, mesh=parallel.expert_fsdp, reshard_after_forward=True
+            )
+            # 每个 expert 已收到整个 EP 组的梯度贡献，使用 dense mesh 的大小作为除数。
+            experts.set_gradient_divide_factor(world)
+            if use_sum:
+                # PyTorch 2.11 的 NCCL PreMulSum 在当前测试环境触发崩溃。
+                experts.set_force_sum_reduction_for_comms(True)
             fully_shard(
                 layer, mesh=parallel.dense, ignored_params=ignored, reshard_after_forward=True
             )
@@ -180,7 +189,7 @@ def sequence_logits(model: nn.Module, input_ids: Tensor, parallel: Parallelism) 
 
 @torch.no_grad()
 def finish_gradients(model: nn.Module, parallel: Parallelism) -> None:
-    """将各 rank 局部 loss 的梯度归一化为 world mean，FSDP 管理的参数已做过组内 AVG。"""
+    """归一化 PLE 表的梯度，并在关闭 FSDP2 时归约参数副本。"""
     world = parallel.dense.size()
     for name, param in model.named_parameters():
         if param.grad is None:
@@ -188,12 +197,7 @@ def finish_gradients(model: nn.Module, parallel: Parallelism) -> None:
         grad = local_tensor(param.grad)
         if name.endswith("ngram_embedding.weight"):
             grad.div_(world)
-        elif ".mlp.experts." in name and parallel.ep.size() > 1:
-            if parallel.fsdp:
-                grad.div_(parallel.ep.size())
-            else:
-                dist.all_reduce(grad, group=parallel.expert_fsdp.get_group())
-                grad.div_(world)
         elif not parallel.fsdp:
-            dist.all_reduce(grad, group=parallel.dense.get_group())
+            mesh = parallel.expert_fsdp if ".mlp.experts." in name else parallel.dense
+            dist.all_reduce(grad, group=mesh.get_group())
             grad.div_(world)

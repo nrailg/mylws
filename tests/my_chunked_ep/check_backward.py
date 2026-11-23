@@ -171,9 +171,13 @@ if __name__ == "__main__":
             if dist.get_rank() == 0:
                 write_fixture(Path(temp), reference)
             dist.broadcast_object_list(paths, src=0)
+            checkpoint = Path(paths[0])
             meshes = Parallelism.create(True, 4, 4)
             for fsdp in (False, True):
-                check_model(Path(paths[0]), deepcopy(reference), replace(meshes, fsdp=fsdp))
+                check_model(checkpoint, deepcopy(reference), replace(meshes, fsdp=fsdp))
+            # expert FSDP mesh 只有一个 rank 时，梯度仍按 world size 归一化。
+            full_ep = Parallelism.create(True, dist.get_world_size(), 4)
+            check_model(checkpoint, deepcopy(reference), full_ep)
             check_empty_expert(local.Qwen4ExpTextConfig(**tiny_config()), meshes)
             dist.barrier()
             if dist.get_rank() == 0:

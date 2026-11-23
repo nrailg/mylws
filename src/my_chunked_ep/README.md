@@ -34,7 +34,7 @@ CP 组内切分同一条等长、无 padding 的 causal prefill 序列，组间�
 
 rank 0 在分布式模型释放后独立加载官方 Transformers，比较拼回原顺序的 CPU logits。纯 FSDP2 要求 BF16 逐位相同。EP 或 CP 使用固定的 `rtol=0.016, atol=0.03125`，同时输出位模式差异数与最大绝对误差。EP 和 CP 会改变每个 expert 的 GEMM 行数，默认 BLAS 设置在本次测试中超出了容差。分布式 bench 对本地模型和官方模型都使用 cuBLASLt，关闭 BF16 reduced-precision reduction 和 split-K。[PyTorch 2.11 的 BF16 GEMM 设置](https://docs.pytorch.org/docs/2.11/backends.html#torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction)
 
-小模型的 FP32 检查覆盖输入及参数梯度、零 token 的 expert、跨 rank 的 PLE 历史和 QSA 块筛选。`finish_gradients` 对各 rank 的局部 mean loss 统一梯度尺度，分别处理 FSDP 的组内平均、expert 副本以及 PLE 行的所有者。
+小模型的 FP32 检查覆盖输入及参数梯度、零 token 的 expert、跨 rank 的 PLE 历史和 QSA 块筛选。Expert FSDP2 用 `set_gradient_divide_factor(world_size)` 将梯度归一化到各 rank 局部 mean loss 的平均值。`finish_gradients` 归一化 PLE 表的梯度，并在关闭 FSDP2 时归约参数副本。
 
 ```bash
 PYTHONPATH=src torchrun --standalone --nproc-per-node=8 tests/my_chunked_ep/check_backward.py
@@ -57,7 +57,7 @@ PYTHONPATH=src torchrun --standalone --nproc-per-node=8 tests/my_chunked_ep/chec
 
 同一节点的单进程四层命令耗时 57.98 s。本地模型和官方模型分别加载 21.82 s 和 16.56 s，3,973,120 个 BF16 logits 全部逐位一致。
 
-四层小模型在 8 卡以 FP32 通过 forward、输入梯度和参数梯度检查。测试固定 EP=4、CP=4，分别开关 FSDP2，覆盖零发送和零接收的 EP rank、跨多个 rank 取 PLE 历史，以及 QSA 实际筛选的 token 与官方选择一致。原始分 rank 记录位于 `$MY_DFS/work/mylws/outputs/my_chunked_ep/20261123-parallel.KmIeGiy7/`。
+四层小模型在 8 卡以 FP32 通过 forward、输入梯度和参数梯度检查。CP=4，EP=4 时分别开关 FSDP2，EP=8 时验证单 rank expert FSDP mesh 的梯度除数。测试覆盖零发送和零接收的 EP rank、跨多个 rank 取 PLE 历史，以及 QSA 实际筛选的 token 与官方选择一致。PyTorch 2.11.0+cu128、NCCL 2.28.9 上，使用自定义除数的 multi-rank expert reduce-scatter 走 `SUM`，再由 FSDP2 归一化。原始分 rank 记录位于 `$MY_DFS/work/mylws/outputs/my_chunked_ep/20261123-parallel.KmIeGiy7/`。
 
 ### H20 单进程对拍
 
