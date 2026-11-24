@@ -11,6 +11,7 @@ Lightweight implementations and examples for personal learning.
 
 ## Examples
 
+- [AllGather context parallelism](examples/context_parallel_all_gather/README.md) overlaps KV head-group communication with BSHD FlashAttention-3 forward and measures the effect of reserving SMs.
 - [CUDA Graph with autograd](examples/cuda_graph_autograd/README.md) captures a single function inside an eager training loop.
 - [CuTe C++ basics](examples/cute/README.md) covers Layout, Tensor, slicing, tiling, thread partition, layout algebra, CUDA SGEMM, and Hopper WGMMA with TMA.
 - [Ray + NIXL communication](examples/ray_nixl/README.md): Transfer GPU tensors between two actors using `ray.put` / `ray.get`.
