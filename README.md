@@ -11,6 +11,7 @@ Lightweight implementations and examples for personal learning.
 
 ## Examples
 
+- [CUDA Graph with autograd](examples/cuda_graph_autograd/README.md) captures a single function inside an eager training loop.
 - [CuTe C++ basics](examples/cute/README.md) covers Layout, Tensor, slicing, tiling, thread partition, layout algebra, CUDA SGEMM, and Hopper WGMMA with TMA.
 - [Ray + NIXL communication](examples/ray_nixl/README.md): Transfer GPU tensors between two actors using `ray.put` / `ray.get`.
 - [TQ as KV](examples/tq/README.md): Read and write tensors by sample key and field name.
