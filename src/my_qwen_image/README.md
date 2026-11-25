@@ -2,6 +2,8 @@
 
 `my_qwen_image.transformer_qwenimage.QwenImageTransformer2DModel` 使用 Diffusers 0.43.0 的组件，可直接从本地 Qwen Image checkpoint 的 `transformer/` 目录加载权重。
 
+See the [DiT test README](../../tests/my_qwen_image/README.md) for the Diffusers and SGLang comparisons.
+
 ## 单卡 forward 对比
 
 在 `mylws` 根目录运行。测试使用 PyTorch 2.11.0+cu128、Diffusers 0.43.0、Transformers 5.16.1、Accelerate 1.16.0 和 VeOmni `86c5ec1d`。
