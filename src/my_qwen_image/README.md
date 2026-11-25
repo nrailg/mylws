@@ -114,7 +114,19 @@ CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 HF_ENABLE_PARALLEL_LOADING=YES PYTHONPAT
 
 ## Inference optimizations
 
-Call `model.enable_inference_optimizations()` after loading weights and completing `.to(device).eval()`. The BF16 CUDA path includes fused norm/modulation/residual, joint QKV destinations, QK RMSNorm + RoPE, and linear + GELU. Dense single-sample inputs project directly into joint QKV buffers. Masked single-sample inputs use a packed text QKV projection before writing the joint buffer.
+Call `model.enable_inference_optimizations()` after loading weights and completing `.to(device).eval()`. The fused kernels target BF16 CUDA inference with gradients and CUDA autocast disabled. The implementation covers six optimizations in [the model](transformer_qwenimage.py), [the inference kernels](inference_kernels.py), and [the benchmark](../../tests/my_qwen_image/benchmark_sglang.py):
+
+1. **Norm, modulation, gate, and residual fusion.** Triton `norm_modulate` combines LayerNorm with scale/shift; `residual_norm_modulate` also folds in the preceding gated residual update; `gated_residual` combines the MLP gate and residual addition. These kernels reduce intermediate tensor traffic and kernel launches while retaining explicit BF16 rounding points for the elementwise operations.
+
+2. **Direct writes into joint QKV buffers.** `project_joint_qkv` allocates Q/K/V buffers with `[text, image]` rows. For dense batch-size-1 inputs, the six text/image projections use `torch.addmm(..., out=...)` to write directly into their destination slices, removing the separate projection buffers and subsequent `cat`. The masked path keeps the joint layout, with packed text projection as described below; padding-mask semantics are preserved.
+
+3. **QK RMSNorm + RoPE fusion.** `qk_norm_rope_` normalizes and rotates Q/K in place in the joint buffers, separately for text and image. It combines FP32 RMS reduction, learned scaling, and RoPE in one Triton launch per stream, preserving the intermediate BF16 casts. This path was verified on the RTX PRO 5000 SM12.0 GPU.
+
+4. **Packed text QKV and linear + GELU.** When a text mask is supplied, eligible batch-size-1 inference uses cached concatenated text Q/K/V weights for one GEMM, then copies its three outputs into the joint buffers. The image and text MLPs use `torch._addmm_activation(..., use_gelu=True)` for the first linear layer and tanh GELU epilogue. The [full-model ablation](#linear--gelu-ablation) measures this fusion's contribution; `fuse_linear_gelu=False` disables it independently.
+
+5. **Reuse RoPE and serial CFG conditioning.** `prepare_inference_rope` prepares position embeddings for reuse across forwards with fixed dimensions. `forward_cfg` shares the timestep embedding and each block's modulation between the positive and negative branches of one CFG pair. Modulation is recomputed for every pair, so a new timestep receives fresh conditioning.
+
+6. **Regional `torch.compile` and full CUDA graph execution.** The benchmark provides block-level compilation and full-forward graph capture for both single forward and serial CFG. Compilation reduces Python dispatch through compiled regions; graph replay reuses a captured launch sequence and updates static input buffers. These modes are selected explicitly with `--modes`; their measured results are in the performance table above.
 
 For a linear + GELU ablation, call `model.enable_inference_optimizations(fuse_linear_gelu=False)` before compiling or capturing CUDA graphs. The benchmark exposes the same setting as `--disable-linear-gelu`.
 
