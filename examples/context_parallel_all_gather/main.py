@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from attention import AllGatherAttention
 
 
-def check_correctness(group: dist.ProcessGroup, sm_margins: list[int]) -> None:
+def check_correctness(group: dist.ProcessGroup, sm_margins: list[int], backend: str) -> None:
     """验证 B>1、MHA/GQA、causal/noncausal 的输出，reference 使用 FP32 SDPA math。"""
     world_size = dist.get_world_size(group)
     rank = dist.get_rank(group)
@@ -31,7 +31,7 @@ def check_correctness(group: dist.ProcessGroup, sm_margins: list[int]) -> None:
                     enable_gqa=True,
                 ).transpose(1, 2)[:, shard]
             for heads_per_group in (1, 2, 4):
-                attention = AllGatherAttention(q, k, heads_per_group, causal, group)
+                attention = AllGatherAttention(q, k, heads_per_group, causal, group, backend)
                 for margin in sm_margins:
                     serial = attention.forward(q, k, v, overlap=False, sm_margin=margin)
                     asynchronous = attention.forward(q, k, v, overlap=True, sm_margin=margin)
@@ -75,7 +75,8 @@ def main() -> None:
     parser.add_argument("--kv-heads", type=int, default=8)
     parser.add_argument("--heads-per-group", type=int, default=2)
     parser.add_argument("--causal", action="store_true")
-    parser.add_argument("--sm-margins", type=int, nargs="+", default=[0, 4, 8, 16])
+    parser.add_argument("--backend", choices=["fa3", "fa4"], default="fa3")
+    parser.add_argument("--sm-margins", type=int, nargs="+")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=5)
@@ -83,6 +84,9 @@ def main() -> None:
     parser.add_argument("--skip-check", action="store_true")
     parser.add_argument("--trace-dir", type=Path)
     args = parser.parse_args()
+    if args.sm_margins is None:
+        args.sm_margins = [0, 4, 8, 16] if args.backend == "fa3" else [0]
+    assert args.backend == "fa3" or args.sm_margins == [0], "FA4 SM120 仅支持 margin=0"
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     dist.init_process_group("nccl", device_id=torch.device("cuda", local_rank))
@@ -93,7 +97,7 @@ def main() -> None:
     assert args.batch_size > 0 and args.iters > 0 and args.repeats > 0
     assert not (args.check_only and args.skip_check)
     if not args.skip_check:
-        check_correctness(group, args.sm_margins)
+        check_correctness(group, args.sm_margins, args.backend)
     if args.check_only:
         dist.destroy_process_group()
         return
@@ -103,13 +107,15 @@ def main() -> None:
     q = torch.randn(args.batch_size, local_seq, args.q_heads, 128, device="cuda").bfloat16()
     k = torch.randn(args.batch_size, local_seq, args.kv_heads, 128, device="cuda").bfloat16()
     v = torch.randn_like(k)
-    attention = AllGatherAttention(q, k, args.heads_per_group, args.causal, group)
-    full_gather = AllGatherAttention(q, k, args.kv_heads, args.causal, group)
+    attention = AllGatherAttention(q, k, args.heads_per_group, args.causal, group, args.backend)
+    full_gather = AllGatherAttention(q, k, args.kv_heads, args.causal, group, args.backend)
     if rank == 0:
         print(json.dumps({
             "cp": world_size, "B": args.batch_size, "S": args.seq_len,
             "Hq": args.q_heads, "Hkv": args.kv_heads, "D": 128,
             "heads_per_group": args.heads_per_group, "causal": args.causal,
+            "backend": args.backend, "warmup": args.warmup,
+            "iters": args.iters, "repeats": args.repeats,
             "torch": torch.__version__, "nccl": torch.cuda.nccl.version(),
             "gpu": torch.cuda.get_device_name(), "sms": attention.num_sms,
             "nccl_env": {name: os.environ.get(name) for name in (

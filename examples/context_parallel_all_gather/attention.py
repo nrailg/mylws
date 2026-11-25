@@ -1,6 +1,5 @@
 import torch
 import torch.distributed as dist
-from flash_attn_interface import flash_attn_func
 
 
 class AllGatherAttention:
@@ -13,6 +12,7 @@ class AllGatherAttention:
         heads_per_group: int,
         causal: bool,
         group: dist.ProcessGroup,
+        backend: str = "fa3",
     ) -> None:
         batch, local_seq, q_heads, head_dim = q.shape
         kv_heads = k.shape[2]
@@ -22,7 +22,16 @@ class AllGatherAttention:
         assert k.shape == (batch, local_seq, kv_heads, head_dim)
         assert q_heads % kv_heads == 0
         assert 0 < heads_per_group <= kv_heads and kv_heads % heads_per_group == 0
-        assert torch.cuda.get_device_capability(q.device)[0] == 9
+        assert backend in ("fa3", "fa4")
+        # 两个后端分别安装；只导入当前设备使用的依赖。
+        if backend == "fa3":
+            assert torch.cuda.get_device_capability(q.device)[0] == 9
+            from flash_attn_interface import flash_attn_func
+        else:
+            assert torch.cuda.get_device_capability(q.device)[0] == 12
+            from flash_attn.cute import flash_attn_func
+        self.backend = backend
+        self.flash_attn_func = flash_attn_func
 
         self.q_shape = q.shape
         self.k_shape = k.shape
@@ -49,7 +58,7 @@ class AllGatherAttention:
 
     def _gather(self, packed: torch.Tensor, index: int) -> None:
         slot = index % 2
-        # 同时等待输入 pack 和上一次使用该 buffer 的 FA3 完成。
+        # 同时等待输入 pack 和上一次使用该 buffer 的 attention 完成。
         self.comm_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.comm_stream):
             with torch.profiler.record_function(f"allgather_head_group_{index}"):
@@ -74,6 +83,10 @@ class AllGatherAttention:
         assert q.dtype == k.dtype == v.dtype == self.buffers[0].dtype
         assert not (q.requires_grad or k.requires_grad or v.requires_grad)
         assert 0 <= sm_margin < self.num_sms
+        assert self.backend == "fa3" or sm_margin == 0, "FA4 SM120 没有 sm_margin API"
+        flash_kwargs = {"causal": self.causal, "num_splits": 1}
+        if self.backend == "fa3":
+            flash_kwargs["sm_margin"] = sm_margin
         batch, local_seq, _, head_dim = k.shape
         # 一次 pack 所有 head group，避免每轮 packing 阻塞下一次通信的提交。
         packed = (
@@ -96,16 +109,10 @@ class AllGatherAttention:
             q_start = index * self.q_heads_per_group
             q_group = q[:, :, q_start : q_start + self.q_heads_per_group]
             with torch.profiler.record_function(f"attention_head_group_{index}"):
-                outputs.append(
-                    flash_attn_func(
-                        q_group,
-                        k_group,
-                        v_group,
-                        causal=self.causal,
-                        num_splits=1,
-                        sm_margin=sm_margin,
-                    )
-                )
+                output = self.flash_attn_func(q_group, k_group, v_group, **flash_kwargs)
+                if self.backend == "fa4":
+                    output, _ = output  # FA4 返回 (out, lse)，这里不需要 lse。
+                outputs.append(output)
             if not overlap and index + 1 < self.num_groups:
                 self._gather(packed, index + 1)
 
