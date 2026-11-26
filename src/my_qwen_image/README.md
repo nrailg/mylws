@@ -183,9 +183,12 @@ python -u tests/my_qwen_image/benchmark_group.py "$QWEN_IMAGE_TRANSFORMER" \
 python -u tests/my_qwen_image/benchmark_group.py "$QWEN_IMAGE_TRANSFORMER" \
   --group-size 8 --batch-size 4 --modes eager --workloads cfg \
   --cases baseline batch-fused batch-cfg
+python -u tests/my_qwen_image/benchmark_prompt_encode.py "$QWEN_IMAGE_MODEL"
 ```
 
-The DiT benchmark uses three independent timestep probes at `0.99`, `0.5`, and `0.01`, and includes preparation in each timed group schedule. It reports sample throughput; CFG pairs contain two sample predictions. `batch-cfg` evaluates both CFG branches in one DiT call, so its effective batch is twice `--batch-size`. Output checks compare each image and branch against serial optimized BF16 inference. Coverage includes DiT forward; full denoising, VAE decoding, and RL reward evaluation require their own measurements.
+`QWEN_IMAGE_MODEL` points to the complete checkpoint directory containing `text_encoder/` and `tokenizer/`. The encoder benchmark uses the official pipeline's `encode_prompt(..., num_images_per_prompt=8)` to encode each positive and negative prompt once and repeat its embeddings.
+
+The DiT benchmark uses three independent timestep probes at `0.99`, `0.5`, and `0.01`, and includes preparation in each timed group schedule. It reports sample throughput; CFG pairs contain two sample predictions. `batch-cfg` evaluates both CFG branches in one DiT call, so its effective batch is twice `--batch-size`. Output checks compare each image and branch against serial optimized BF16 inference. Coverage includes DiT forward and separate text encoding; full denoising, VAE decoding, and RL reward evaluation require their own measurements.
 
 The following results were measured on 2026-11-25 with the full 20,430,401,088-parameter checkpoint, RTX PRO 5000 72 GB GPUs, PyTorch 2.14.1+cu130, Diffusers 0.43.0, BF16, Flash SDPA, and linear + GELU enabled. Each DiT result is the median of three group schedules after one warmup. Every throughput ratio uses the serial baseline measured on the same physical GPU. Numerical acceptance requires finite outputs and maximum per-image, per-branch relative L2 error at most 2% against that baseline.
 
@@ -233,6 +236,8 @@ Merging positive and negative CFG branches into one call produced these separate
 
 ### 3. Prompt reuse
 
+On 2026-11-25, the official BF16 text encoder on an RTX PRO 5000 took **430.570 ms** to encode the same positive and negative prompts independently for eight samples, versus **54.143 ms** to encode each prompt once and repeat its embeddings: **7.95× encoder throughput**. Both figures include group embedding preparation and are medians of three measurements after two warmups. Embeddings matched bitwise. The positive and negative prompts produced 22 and 13 valid tokens respectively; peak allocated memory was 15.508 and 15.507 GiB. These are encoder-only measurements. The log is `$MY_DFS/work/mylws/outputs/my_qwen_image/group-reuse/prompt-encode.log`.
+
 Within the DiT, text projection reuse alone gave throughput ratios of 0.9901 for single forward and 1.0019 for CFG. Adding first-block text QKV reuse gave 0.9929 and 1.0102; the CUDA graph ratios were 1.0021 and 0.9924. These cases preserved bitwise outputs and showed no consistent throughput gain at 256 text tokens.
 
 ### Validation and limitations
@@ -241,7 +246,7 @@ All 11 focused GPU regressions passed, covering batch layouts, arbitrary text ma
 
 Bold errors in the tables exceed the unchanged 2% threshold. Those configurations are not accepted by this comparison. The 512×512 batch-8 attention fallback also failed at 2.824%; a matched comparison with joint attention fusion disabled on both batch-1 and batch-8 paths still showed 2.858% error. Batch arithmetic differences therefore occur without the new joint attention fusion. Prepared conditioning reduced the measured errors, but the results do not establish equivalence for complete denoising trajectories or RL log-probabilities. CFG merging was tested with equally sized, 256-token positive and negative inputs; real unequal-length prompts require compatible masks or separate branches.
 
-Logs are under `$MY_DFS/work/mylws/outputs/my_qwen_image/group-reuse/`: `dit-1024-eager-b2.log`, `dit-1024-eager-b4.log`, `dit-1024-eager-b8.log`, `dit-1024-graph-single.log`, `dit-1024-graph-cfg.log`, `dit-512-eager-b8.log`, `dit-512-eager-cfg-b4.log`, `dit-512-cfg-parity-diagnostic.log`, and `kernel-regression.log`. The batch-2 1024 eager run and both 512 CFG comparison runs exited with numerical failures for the configurations identified above. Other full-model comparison runs passed.
+Logs are under `$MY_DFS/work/mylws/outputs/my_qwen_image/group-reuse/`: `dit-1024-eager-b2.log`, `dit-1024-eager-b4.log`, `dit-1024-eager-b8.log`, `dit-1024-graph-single.log`, `dit-1024-graph-cfg.log`, `dit-512-eager-b8.log`, `dit-512-eager-cfg-b4.log`, `dit-512-cfg-parity-diagnostic.log`, `kernel-regression.log`, and `prompt-encode.log`. The batch-2 1024 eager run and both 512 CFG comparison runs exited with numerical failures for the configurations identified above. Other full-model comparison runs passed.
 
 For current microbatch-2 and microbatch-4 comparisons, use the first group benchmark command with the corresponding `--batch-size` and `--cases baseline batch-reference batch-fused batch-cfg`. The retained 512×512 cases use `--image-size 512 --batch-size 8 --cases baseline batch-reference batch-fused`; the merged-CFG comparison uses the second command with `--image-size 512`. The retained one-step graph cases use `--modes graph --timesteps 0.5 --cases baseline text`. Historical modulation-only and `Combined` measurements remain available in the logs above.
 
