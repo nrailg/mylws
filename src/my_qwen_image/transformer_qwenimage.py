@@ -14,6 +14,7 @@
 
 import math
 from math import prod
+from types import ModuleType
 from typing import Any
 
 import numpy as np
@@ -470,6 +471,16 @@ class QwenEmbedLayer3DRope(nn.Module):
         return freqs.clone().contiguous()
 
 
+def _use_inference_kernels(x: torch.Tensor) -> bool:
+    return (
+        x.is_cuda
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and not torch.is_grad_enabled()
+        and not torch.is_autocast_enabled("cuda")
+    )
+
+
 class QwenDoubleStreamAttnProcessor2_0:
     """
     Attention processor for Qwen double-stream architecture, matching DoubleStreamLayerMegatron logic. This processor
@@ -588,6 +599,8 @@ class QwenDoubleStreamAttnProcessor2_0:
 
 @maybe_allow_in_graph
 class QwenImageTransformerBlock(nn.Module):
+    _inference_kernels: ModuleType | None = None
+
     def __init__(
         self,
         dim: int,
@@ -696,47 +709,55 @@ class QwenImageTransformerBlock(nn.Module):
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
 
-        # Process image stream - norm1 + modulation
-        img_normed = self.img_norm1(hidden_states)
-        img_modulated, img_gate1 = self._modulate(img_normed, img_mod1, modulate_index)
+        kernels = self._inference_kernels
+        fused = (
+            kernels is not None
+            and not self.training
+            and modulate_index is None
+            and isinstance(self.attn.processor, QwenDoubleStreamAttnProcessor2_0)
+            and _use_inference_kernels(hidden_states)
+            and _use_inference_kernels(encoder_hidden_states)
+            and hidden_states.numel() > 0
+            and encoder_hidden_states.numel() > 0
+        )
+        if fused:
+            img_modulated = kernels.norm_modulate(hidden_states, img_mod1, self.img_norm1.eps)
+            txt_modulated = kernels.norm_modulate(encoder_hidden_states, txt_mod1, self.txt_norm1.eps)
+        else:
+            img_modulated, img_gate1 = self._modulate(
+                self.img_norm1(hidden_states), img_mod1, modulate_index
+            )
+            txt_modulated, txt_gate1 = self._modulate(self.txt_norm1(encoder_hidden_states), txt_mod1)
 
-        # Process text stream - norm1 + modulation
-        txt_normed = self.txt_norm1(encoder_hidden_states)
-        txt_modulated, txt_gate1 = self._modulate(txt_normed, txt_mod1)
-
-        # Use QwenAttnProcessor2_0 for joint attention computation
-        # This directly implements the DoubleStreamLayerMegatron logic:
-        # 1. Computes QKV for both streams
-        # 2. Applies QK normalization and RoPE
-        # 3. Concatenates and runs joint attention
-        # 4. Splits results back to separate streams
         joint_attention_kwargs = joint_attention_kwargs or {}
-        attn_output = self.attn(
-            hidden_states=img_modulated,  # Image stream (will be processed as "sample")
-            encoder_hidden_states=txt_modulated,  # Text stream (will be processed as "context")
+        img_attn_output, txt_attn_output = self.attn(
+            hidden_states=img_modulated,
+            encoder_hidden_states=txt_modulated,
             encoder_hidden_states_mask=encoder_hidden_states_mask,
             image_rotary_emb=image_rotary_emb,
             **joint_attention_kwargs,
         )
 
-        # QwenAttnProcessor2_0 returns (img_output, txt_output) when encoder_hidden_states is provided
-        img_attn_output, txt_attn_output = attn_output
-
-        # Apply attention gates and add residual (like in Megatron)
-        hidden_states = hidden_states + img_gate1 * img_attn_output
-        encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
-
-        # Process image stream - norm2 + MLP
-        img_normed2 = self.img_norm2(hidden_states)
-        img_modulated2, img_gate2 = self._modulate(img_normed2, img_mod2, modulate_index)
-        img_mlp_output = self.img_mlp(img_modulated2)
-        hidden_states = hidden_states + img_gate2 * img_mlp_output
-
-        # Process text stream - norm2 + MLP
-        txt_normed2 = self.txt_norm2(encoder_hidden_states)
-        txt_modulated2, txt_gate2 = self._modulate(txt_normed2, txt_mod2)
-        txt_mlp_output = self.txt_mlp(txt_modulated2)
-        encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
+        if fused:
+            hidden_states, img_modulated2 = kernels.residual_norm_modulate(
+                hidden_states, img_attn_output, img_mod1, img_mod2, self.img_norm2.eps
+            )
+            encoder_hidden_states, txt_modulated2 = kernels.residual_norm_modulate(
+                encoder_hidden_states, txt_attn_output, txt_mod1, txt_mod2, self.txt_norm2.eps
+            )
+            img_mlp_output = self.img_mlp(img_modulated2)
+            hidden_states = kernels.gated_residual(hidden_states, img_mlp_output, img_mod2)
+            txt_mlp_output = self.txt_mlp(txt_modulated2)
+            encoder_hidden_states = kernels.gated_residual(encoder_hidden_states, txt_mlp_output, txt_mod2)
+        else:
+            hidden_states = hidden_states + img_gate1 * img_attn_output
+            encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
+            img_modulated2, img_gate2 = self._modulate(
+                self.img_norm2(hidden_states), img_mod2, modulate_index
+            )
+            hidden_states = hidden_states + img_gate2 * self.img_mlp(img_modulated2)
+            txt_modulated2, txt_gate2 = self._modulate(self.txt_norm2(encoder_hidden_states), txt_mod2)
+            encoder_hidden_states = encoder_hidden_states + txt_gate2 * self.txt_mlp(txt_modulated2)
 
         # Clip to prevent overflow for fp16
         if encoder_hidden_states.dtype == torch.float16:
@@ -866,6 +887,14 @@ class QwenImageTransformer2DModel(
 
         self.gradient_checkpointing = False
         self.zero_cond_t = zero_cond_t
+
+    def enable_inference_optimizations(self) -> None:
+        """Prepare BF16 CUDA inference for the current device and weights."""
+        # Load Triton when the caller enables CUDA inference optimizations.
+        from . import inference_kernels
+
+        for block in self.transformer_blocks:
+            block._inference_kernels = inference_kernels
 
     def prepare_inference_rope(
         self,
