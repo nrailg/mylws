@@ -150,6 +150,84 @@ with torch.inference_mode():
 
 `tests/my_qwen_image/benchmark_sglang.py` 支持 eager、完整 CUDA graph 和 regional `torch.compile`。CUDA graph replay 在 shape 和模型权重保持固定时更新输入 tensor；权重变化后需要重新 capture。Regional compilation 对每个 transformer block 调用 `compile(dynamic=False, options={"triton.cudagraphs": False})`。
 
+## 多图 DiT 与 text encoder 性能测试
+
+使用上面的 benchmark 环境。`QWEN_IMAGE_MODEL` 指向包含 `text_encoder/` 和 `tokenizer/` 的完整 checkpoint 目录。
+
+```bash
+python -u tests/my_qwen_image/benchmark_group.py "$QWEN_IMAGE_TRANSFORMER" \
+  --group-size 8 --batch-size 8 --modes eager \
+  --cases baseline batch-reference batch-fused
+python -u tests/my_qwen_image/benchmark_group.py "$QWEN_IMAGE_TRANSFORMER" \
+  --group-size 8 --batch-size 4 --modes eager --workloads cfg \
+  --cases baseline batch-fused batch-cfg
+python -u tests/my_qwen_image/benchmark_prompt_encode.py "$QWEN_IMAGE_MODEL"
+```
+
+DiT 性能测试对比串行执行、普通 batched attention、融合 batched attention 和 CFG 合批。Text encoder 性能测试使用 Diffusers 的 `encode_prompt(..., num_images_per_prompt=8)`，对比重复编码与编码一次后扩展 embeddings。
+
+DiT 性能测试使用 `0.99`、`0.5` 和 `0.01` 三个独立 timestep probe，并将准备开销计入每个 group schedule 的计时。结果报告 sample throughput；一个 CFG pair 包含两次 sample prediction。`batch-cfg` 在一次 DiT 调用中计算两个 CFG 分支，因此 effective batch 是 `--batch-size` 的两倍。输出检查逐图、逐分支对比优化后的串行 BF16 inference。验证范围包括 DiT forward 和独立 text encoding；完整 denoising、VAE decoding 和 RL reward evaluation 需要另行测量。
+
+以下历史结果早于 `nrwu/dev1` 上的改动，包括 masked text QKV 权重改为按需打包。测试于 2026-11-25 完成，使用完整的 20,430,401,088 参数 checkpoint、RTX PRO 5000 72 GB GPU、PyTorch 2.14.1+cu130、Diffusers 0.43.0、BF16、Flash SDPA，并启用 linear + GELU。每项 DiT 结果在预热一次后测量三个 group schedule，取中位数。每个 throughput ratio 都使用同一张物理 GPU 上测得的串行 baseline。数值验收要求输出为有限值，并且相对该 baseline 的逐图、逐分支最大 relative L2 error 不超过 2%。
+
+### 1. 整组 modulation 复用（历史结果）
+
+截至 2026-11-26，整组 modulation 复用已不再保留。实测吞吐提升只有 0.5–2.7%，不足以抵消额外的代码复杂度。共享 timestep API 及其 benchmark case 已删除。单次 `forward_cfg` 调用的两个分支仍会复用 modulation。
+
+2026-11-26 对早期实现的验证通过全部 11 项 GPU 回归测试，以及保留路径的 22 个适用 tiny-model benchmark 组合。全部 11 个变化输入的 graph replay 都与 eager 逐位一致。日志位于 `$MY_DFS/work/mylws/outputs/my_qwen_image/group-reuse-revert/20261126/gpu-regression.log`。
+
+该实验在多次 forward 之间共享 timestep embedding 和 modulation，所有测量 case 的输出均逐位一致：
+
+| 执行方式 | 工作负载 | 每个 schedule 的 timestep 数 | 串行 schedule（ms） | 共享 modulation（ms） | 吞吐比 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Eager | 单次 forward | 3 | 11314.229 | 11108.791 | 1.0185 |
+| Eager | 串行 CFG | 3 | 22441.117 | 22168.336 | 1.0123 |
+| CUDA graph | 单次 forward | 1 | 3738.000 | 3638.968 | 1.0272 |
+| CUDA graph | 串行 CFG | 1 | 7358.284 | 7320.285 | 1.0052 |
+
+所有行都使用 8 张 1024×1024 图像。Graph 测量使用 timestep `0.5`，并将准备过程包含在 capture 的 schedule 中。每个 graph 还使用变化后的 latent、text 和 timestep 与 eager 对比，replay 结果均逐位一致。
+
+### 2. 批量 DiT
+
+在相同 batch size 下，融合路径相对已有 attention fallback 的吞吐提升约 14–16%。相对优化后串行 inference 的收益取决于分辨率。`Combined` 表示同时复用整组 timestep conditioning、text projection 和首层 text QKV 的历史配置。这些结果仅作为实验记录保留，不对应当前可用的 benchmark case。下表中的 CFG 分支采用串行执行。
+
+| 分辨率 | 工作负载 | Microbatch | Fused / 串行吞吐 | Combined / 串行吞吐 | Fused 最大 relative L2 | Combined 最大 relative L2 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 1024×1024 | 单次 forward | 2 | 1.0101 | 1.0233 | 1.811% | 1.566% |
+| 1024×1024 | CFG | 2 | 1.0093 | 1.0162 | **2.324%** | 1.800% |
+| 1024×1024 | 单次 forward | 4 | 0.9837 | 0.9880 | 1.020% | 1.069% |
+| 1024×1024 | CFG | 4 | 0.9864 | 0.9890 | 1.227% | 1.096% |
+| 1024×1024 | 单次 forward | 8 | 0.9071 | 0.9077 | 1.844% | 1.307% |
+| 1024×1024 | CFG | 8 | 0.8995 | 0.9087 | 1.844% | 1.360% |
+| 512×512 | 单次 forward | 8 | 1.3624 | 1.3541 | 0.936% | 0.839% |
+| 512×512 | CFG | 8 | 1.2964 | 1.2993 | **2.952%** | 1.577% |
+
+在 512×512 下，通过验收的最快单次 forward schedule 耗时 2868.568 ms，串行耗时为 3908.191 ms；通过验收的最快 CFG schedule 使用 `Combined`，耗时 5731.523 ms，串行耗时为 7446.896 ms。在 1024×1024 下，batch-2 `Combined` 的 eager 结果最好，更大的 batch 会降低吞吐。其单 timestep CUDA graph 的吞吐比分别为 1.0197（单次 forward）和 1.0064（CFG），两种情况下的最大 relative L2 都是 0.551%。
+
+将 positive 和 negative CFG 分支合并到一次调用中，得到以下结果：
+
+| 分辨率 | Image microbatch / effective DiT batch | Merged / 串行 B1 吞吐 | Merged / 相同 microbatch 串行 CFG 吞吐 | 最大 relative L2 |
+| --- | --- | ---: | ---: | ---: |
+| 1024×1024 | 2 / 4 | 0.9822 | 0.9732 | 1.227% |
+| 1024×1024 | 4 / 8 | 0.9028 | 0.9152 | 1.844% |
+| 512×512 | 4 / 8 | 1.2793 | 1.0378 | **2.952%** |
+
+### 3. Prompt 复用
+
+2026-11-25，在 RTX PRO 5000 上使用官方 BF16 text encoder，为 8 个 sample 分别编码相同的 positive 和 negative prompt 耗时 **430.570 ms**；每个 prompt 只编码一次并重复其 embeddings 耗时 **54.143 ms**，encoder throughput 提升 **7.95×**。两个结果都包含 group embedding 准备开销，并在预热两次后测量三次，取中位数。两条路径产生的 embeddings 逐位一致。Positive 和 negative prompt 分别生成 22 和 13 个 valid token；峰值 allocated memory 分别为 15.508 和 15.507 GiB。以上仅为 encoder 测量。日志位于 `$MY_DFS/work/mylws/outputs/my_qwen_image/group-reuse/prompt-encode.log`。
+
+在 PR #8 的独立历史 DiT 实验中，仅复用 text projection 时，单次 forward 和 CFG 的吞吐比分别为 0.9901 和 1.0019。加入首层 text QKV 复用后分别为 0.9929 和 1.0102；CUDA graph 的吞吐比分别为 1.0021 和 0.9924。这些 case 的输出逐位一致，但在 256 个 text token 下没有稳定的吞吐收益。该实验保留在此处供参考。当前 benchmark 仅暴露 batching case。
+
+### 验证与限制
+
+全部 11 项 GPU 定向回归测试均通过，覆盖 batch layout、任意 text mask、prepared tensor 的只读复用，以及 checkpoint 更新后的 compiled inference。使用变化输入时，CUDA graph replay 与对应 eager 路径逐位一致。
+
+表格中的粗体误差超过了保持不变的 2% 阈值，因此对应配置未通过本次验收。512×512 batch-8 attention fallback 也以 2.824% 的误差失败；在 batch-1 和 batch-8 路径上同时关闭 joint attention fusion 后进行匹配对比，误差仍为 2.858%。因此，即使不使用新增的 joint attention fusion，batch arithmetic 也会产生差异。Prepared conditioning 降低了实测误差，但这些结果不足以证明完整 denoising trajectory 或 RL log-probability 等价。CFG 合批使用长度相同的 256-token positive 和 negative input；真实的非等长 prompt 需要兼容的 mask 或使用独立分支。
+
+日志位于 `$MY_DFS/work/mylws/outputs/my_qwen_image/group-reuse/`，包括 `dit-1024-eager-b2.log`、`dit-1024-eager-b4.log`、`dit-1024-eager-b8.log`、`dit-1024-graph-single.log`、`dit-1024-graph-cfg.log`、`dit-512-eager-b8.log`、`dit-512-eager-cfg-b4.log`、`dit-512-cfg-parity-diagnostic.log`、`kernel-regression.log` 和 `prompt-encode.log`。Batch-2 1024 eager run 和两个 512 CFG comparison run 因上述配置的数值检查失败而退出。其余完整模型 comparison run 均通过。
+
+当前 microbatch-2 和 microbatch-4 对比使用第一条 group benchmark 命令，并设置相应的 `--batch-size` 和 `--cases baseline batch-reference batch-fused batch-cfg`。保留的 512×512 case 使用 `--image-size 512 --batch-size 8 --cases baseline batch-reference batch-fused`；merged CFG 对比使用第二条命令并增加 `--image-size 512`。如需在单 timestep CUDA graph 中比较 batching，使用 `--modes graph --timesteps 0.5 --cases baseline batch-fused`。历史 modulation-only 和 `Combined` 测量仍保留在上述日志中。
+
 ## SGLang 优化参考
 
 2026-11-25 核对 [SGLang v0.5.23](https://github.com/sgl-project/sglang/releases/tag/v0.5.23)，commit `297e54fd105e974cdf401e5b4d20253a22c16f90`。本地 checkout 位于 `~/work/sglang`。
