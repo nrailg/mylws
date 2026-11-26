@@ -682,13 +682,14 @@ class QwenImageTransformerBlock(nn.Module):
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         joint_attention_kwargs: dict[str, Any] | None = None,
         modulate_index: list[int] | None = None,
+        modulation: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Get modulation parameters for both streams
-        img_mod_params = self.img_mod(temb)  # [B, 6*dim]
-
-        if self.zero_cond_t:
-            temb = torch.chunk(temb, 2, dim=0)[0]
-        txt_mod_params = self.txt_mod(temb)  # [B, 6*dim]
+        if modulation is None:
+            img_mod_params = self.img_mod(temb)
+            text_temb = temb.chunk(2, dim=0)[0] if self.zero_cond_t else temb
+            txt_mod_params = self.txt_mod(text_temb)
+        else:
+            img_mod_params, txt_mod_params = modulation
 
         # Split modulation parameters for norm1 and norm2
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
@@ -865,6 +866,56 @@ class QwenImageTransformer2DModel(
         self.gradient_checkpointing = False
         self.zero_cond_t = zero_cond_t
 
+    @torch.no_grad()
+    def forward_cfg(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        negative_encoder_hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        *,
+        img_shapes: list[tuple[int, int, int]] | None = None,
+        encoder_hidden_states_mask: torch.Tensor | None = None,
+        negative_encoder_hidden_states_mask: torch.Tensor | None = None,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        additional_t_cond: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return positive and negative predictions from serial CFG at the same timestep."""
+        assert not self.training, "forward_cfg requires eval mode"
+        positive_image = self.img_in(hidden_states)
+        temb, modulate_index = self._timestep_conditioning(
+            timestep, positive_image, img_shapes, None, additional_t_cond
+        )
+        # Keep modulation local to each CFG pair so the next call uses its own timestep.
+        text_temb = temb.chunk(2, dim=0)[0] if self.zero_cond_t else temb
+        modulation = tuple(
+            (block.img_mod(temb), block.txt_mod(text_temb)) for block in self.transformer_blocks
+        )
+
+        text_len = encoder_hidden_states.shape[1]
+        if image_rotary_emb is None:
+            image_rotary_emb = self.pos_embed(
+                img_shapes, max_txt_seq_len=text_len, device=positive_image.device
+            )
+
+        negative_text_len = negative_encoder_hidden_states.shape[1]
+        negative_rotary_emb = image_rotary_emb
+        if negative_text_len != text_len:
+            assert img_shapes is not None, "img_shapes required for different text lengths"
+            negative_rotary_emb = self.pos_embed(
+                img_shapes, max_txt_seq_len=negative_text_len, device=positive_image.device
+            )
+
+        positive = self._forward_transformer(
+            positive_image, encoder_hidden_states, encoder_hidden_states_mask,
+            temb, modulate_index, image_rotary_emb, None, None, modulation,
+        )
+        negative = self._forward_transformer(
+            self.img_in(hidden_states), negative_encoder_hidden_states, negative_encoder_hidden_states_mask,
+            temb, modulate_index, negative_rotary_emb, None, None, modulation,
+        )
+        return positive, negative
+
     @apply_lora_scale("attention_kwargs")
     def forward(
         self,
@@ -878,6 +929,7 @@ class QwenImageTransformer2DModel(
         controlnet_block_samples=None,
         additional_t_cond=None,
         return_dict: bool = True,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> Transformer2DModelOutput | tuple[torch.Tensor]:
         """
         The [`QwenTransformer2DModel`] forward method.
@@ -914,7 +966,29 @@ class QwenImageTransformer2DModel(
             `tuple` where the first element is the sample tensor.
         """
         hidden_states = self.img_in(hidden_states)
+        temb, modulate_index = self._timestep_conditioning(
+            timestep, hidden_states, img_shapes, guidance, additional_t_cond
+        )
+        if image_rotary_emb is None:
+            image_rotary_emb = self.pos_embed(
+                img_shapes, max_txt_seq_len=encoder_hidden_states.shape[1], device=hidden_states.device
+            )
+        output = self._forward_transformer(
+            hidden_states, encoder_hidden_states, encoder_hidden_states_mask, temb,
+            modulate_index, image_rotary_emb, attention_kwargs, controlnet_block_samples,
+        )
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
 
+    def _timestep_conditioning(
+        self,
+        timestep: torch.Tensor,
+        hidden_states: torch.Tensor,
+        img_shapes: list[tuple[int, int, int]] | None,
+        guidance: torch.Tensor | None,
+        additional_t_cond: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         timestep = timestep.to(hidden_states.dtype)
 
         if self.zero_cond_t:
@@ -927,14 +1001,6 @@ class QwenImageTransformer2DModel(
         else:
             modulate_index = None
 
-        encoder_hidden_states = self.txt_norm(encoder_hidden_states)
-        encoder_hidden_states = self.txt_in(encoder_hidden_states)
-
-        # Use the encoder_hidden_states sequence length for RoPE computation and normalize mask
-        text_seq_len, _, encoder_hidden_states_mask = compute_text_seq_len_from_mask(
-            encoder_hidden_states, encoder_hidden_states_mask
-        )
-
         if guidance is not None:
             guidance = guidance.to(hidden_states.dtype) * 1000
 
@@ -944,7 +1010,25 @@ class QwenImageTransformer2DModel(
             else self.time_text_embed(timestep, guidance, hidden_states, additional_t_cond)
         )
 
-        image_rotary_emb = self.pos_embed(img_shapes, max_txt_seq_len=text_seq_len, device=hidden_states.device)
+        return temb, modulate_index
+
+    def _forward_transformer(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_mask: torch.Tensor | None,
+        temb: torch.Tensor,
+        modulate_index: torch.Tensor | None,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        attention_kwargs: dict[str, Any] | None,
+        controlnet_block_samples: list[torch.Tensor] | None,
+        modulation: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None,
+    ) -> torch.Tensor:
+        encoder_hidden_states = self.txt_norm(encoder_hidden_states)
+        encoder_hidden_states = self.txt_in(encoder_hidden_states)
+        _, _, encoder_hidden_states_mask = compute_text_seq_len_from_mask(
+            encoder_hidden_states, encoder_hidden_states_mask
+        )
 
         for index_block, block in enumerate(self.transformer_blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
@@ -968,6 +1052,7 @@ class QwenImageTransformer2DModel(
                     image_rotary_emb=image_rotary_emb,
                     joint_attention_kwargs=attention_kwargs,
                     modulate_index=modulate_index,
+                    modulation=None if modulation is None else modulation[index_block],
                 )
 
             # controlnet residual
@@ -980,9 +1065,4 @@ class QwenImageTransformer2DModel(
             temb = temb.chunk(2, dim=0)[0]
         # Use only the image part (hidden_states) from the dual-stream blocks
         hidden_states = self.norm_out(hidden_states, temb)
-        output = self.proj_out(hidden_states)
-
-        if not return_dict:
-            return (output,)
-
-        return Transformer2DModelOutput(sample=output)
+        return self.proj_out(hidden_states)
