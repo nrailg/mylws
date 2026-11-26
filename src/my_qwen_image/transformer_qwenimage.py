@@ -673,12 +673,6 @@ class QwenImageTransformerBlock(nn.Module):
 
         return x * (1 + scale_result) + shift_result, gate_result
 
-    def _modulation(self, temb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        img_mod_params = self.img_mod(temb)
-        if self.zero_cond_t:
-            temb = temb.chunk(2, dim=0)[0]
-        return img_mod_params, self.txt_mod(temb)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -690,7 +684,12 @@ class QwenImageTransformerBlock(nn.Module):
         modulate_index: list[int] | None = None,
         modulation: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        img_mod_params, txt_mod_params = self._modulation(temb) if modulation is None else modulation
+        if modulation is None:
+            img_mod_params = self.img_mod(temb)
+            text_temb = temb.chunk(2, dim=0)[0] if self.zero_cond_t else temb
+            txt_mod_params = self.txt_mod(text_temb)
+        else:
+            img_mod_params, txt_mod_params = modulation
 
         # Split modulation parameters for norm1 and norm2
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
@@ -888,7 +887,10 @@ class QwenImageTransformer2DModel(
             timestep, positive_image, img_shapes, None, additional_t_cond
         )
         # Keep modulation local to each CFG pair so the next call uses its own timestep.
-        modulation = tuple(block._modulation(temb) for block in self.transformer_blocks)
+        text_temb = temb.chunk(2, dim=0)[0] if self.zero_cond_t else temb
+        modulation = tuple(
+            (block.img_mod(temb), block.txt_mod(text_temb)) for block in self.transformer_blocks
+        )
 
         text_len = encoder_hidden_states.shape[1]
         if image_rotary_emb is None:
