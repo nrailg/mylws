@@ -130,6 +130,7 @@ def _qk_norm_rope(
     K_WEIGHT,
     FREQS,
     SEQUENCE: tl.constexpr,
+    BATCH: tl.constexpr,
     HEADS: tl.constexpr,
     WIDTH: tl.constexpr,
     Q_STRIDE: tl.constexpr,
@@ -158,7 +159,7 @@ def _qk_norm_rope(
     norm = _round_bf16(norm * weight[None, :])
 
     # view_as_real interleaves the real and imaginary components of complex64 RoPE.
-    freq_offset = token[:, None] * FREQ_STRIDE + (col[None, :] // 2) * 2
+    freq_offset = (token[:, None] // BATCH) * FREQ_STRIDE + (col[None, :] // 2) * 2
     cos = tl.load(FREQS + freq_offset, valid, 0)
     sin = tl.load(FREQS + freq_offset + 1, valid, 0)
     partner = tl.gather(norm, tl.broadcast_to((col ^ 1)[None, :], (HEAD_ROWS, HEAD_BLOCK)), 1)
@@ -175,15 +176,39 @@ def qk_norm_rope_(
     freqs: torch.Tensor,
     q_eps: float,
     k_eps: float,
+    batch_size: int = 1,
 ) -> None:
     seq = q.shape[0]
     width = q_weight.numel()
     heads = q.shape[-1] // width
     wrap_triton(_qk_norm_rope)[(triton.cdiv(seq * heads, 4), 2)](
-        q, k, q_weight, k_weight, freqs, seq, heads, width, q.stride(0),
+        q, k, q_weight, k_weight, freqs, seq, batch_size, heads, width, q.stride(0),
         k.stride(0), freqs.stride(0), q_eps, k_eps, 4, triton.next_power_of_2(width),
         enable_fp_fusion=False,
     )
+
+
+def _project_text_qkv(
+    text: torch.Tensor,
+    outputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    text_weights: list[torch.Tensor],
+    text_biases: list[torch.Tensor],
+    packed_text_weight: torch.Tensor | None,
+    packed_text_bias: torch.Tensor | None,
+    packed_text_versions: list[int],
+) -> None:
+    # Check the source parameter versions on each call before using packed weights.
+    use_packed_text = packed_text_weight is not None and all(
+        param._version == version
+        for param, version in zip((*text_weights, *text_biases), packed_text_versions)
+    )
+    if not use_packed_text:
+        for out, weight, bias in zip(outputs, text_weights, text_biases):
+            torch.addmm(bias, text, weight.t(), out=out)
+    else:
+        packed_qkv = torch.nn.functional.linear(text, packed_text_weight, packed_text_bias)
+        for out, projection in zip(outputs, packed_qkv.chunk(3, dim=-1)):
+            out.copy_(projection)
 
 
 def project_joint_qkv(
@@ -196,27 +221,49 @@ def project_joint_qkv(
     packed_text_weight: torch.Tensor | None,
     packed_text_bias: torch.Tensor | None,
     packed_text_versions: list[int],
+    batch_size: int = 1,
+    first_block_text_qkv: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Contiguous [text, image] rows let GEMM use the cuBLASLt bias epilogue.
-    text_len = text.shape[0]
+    # Flatten sequence-major streams into contiguous [text, image] GEMM destinations.
+    text_len = text.shape[0] * batch_size if first_block_text_qkv else text.shape[0]
     shape = (text_len + image.shape[0], image_weights[0].shape[0])
     query, key, value = (image.new_empty(shape) for _ in range(3))
     buffers = (query, key, value)
     for out, weight, bias in zip(buffers, image_weights, image_biases):
         torch.addmm(bias, image, weight.t(), out=out[text_len:])
 
-    # Check the source parameter versions on each call before using packed weights.
-    use_packed_text = packed_text_weight is not None and all(
-        param._version == version
-        for param, version in zip((*text_weights, *text_biases), packed_text_versions)
-    )
-    if not use_packed_text:
-        for out, weight, bias in zip(buffers, text_weights, text_biases):
-            torch.addmm(bias, text, weight.t(), out=out[:text_len])
+    if first_block_text_qkv:
+        for out, projection in zip(buffers, first_block_text_qkv):
+            out[:text_len].unflatten(0, (-1, batch_size)).copy_(projection.unsqueeze(1))
     else:
-        packed_qkv = torch.nn.functional.linear(text, packed_text_weight, packed_text_bias)
-        for out, projection in zip(buffers, packed_qkv.chunk(3, dim=-1)):
-            out[:text_len].copy_(projection)
+        _project_text_qkv(
+            text, (query[:text_len], key[:text_len], value[:text_len]), text_weights, text_biases,
+            packed_text_weight, packed_text_bias, packed_text_versions,
+        )
+    return query, key, value
+
+
+def prepare_text_qkv(
+    text: torch.Tensor,
+    text_weights: list[torch.Tensor],
+    text_biases: list[torch.Tensor],
+    packed_text_weight: torch.Tensor | None,
+    packed_text_bias: torch.Tensor | None,
+    packed_text_versions: list[int],
+    text_freqs: torch.Tensor,
+    norm_weights: list[torch.Tensor],
+    norm_eps: list[float],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    shape = (text.shape[0], text_weights[0].shape[0])
+    query, key, value = (text.new_empty(shape) for _ in range(3))
+    _project_text_qkv(
+        text, (query, key, value), text_weights, text_biases,
+        packed_text_weight, packed_text_bias, packed_text_versions,
+    )
+    qk_norm_rope_(
+        query, key, norm_weights[0], norm_weights[1],
+        torch.view_as_real(text_freqs.resolve_conj()), norm_eps[0], norm_eps[1],
+    )
     return query, key, value
 
 
@@ -235,20 +282,23 @@ def joint_qkv(
     text_freqs: torch.Tensor,
     norm_weights: list[torch.Tensor],
     norm_eps: list[float],
+    batch_size: int,
+    first_block_text_qkv: list[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     query, key, value = project_joint_qkv(
         image, text, image_weights, image_biases, text_weights, text_biases,
-        packed_text_weight, packed_text_bias, packed_text_versions,
+        packed_text_weight, packed_text_bias, packed_text_versions, batch_size, first_block_text_qkv,
     )
-    text_len = text.shape[0]
+    text_len = query.shape[0] - image.shape[0]
     # Keep projection and in-place QK updates inside one functional op for the compiler.
-    qk_norm_rope_(
-        query[:text_len], key[:text_len], norm_weights[2], norm_weights[3],
-        torch.view_as_real(text_freqs.resolve_conj()), norm_eps[2], norm_eps[3],
-    )
+    if not first_block_text_qkv:
+        qk_norm_rope_(
+            query[:text_len], key[:text_len], norm_weights[2], norm_weights[3],
+            torch.view_as_real(text_freqs.resolve_conj()), norm_eps[2], norm_eps[3], batch_size,
+        )
     qk_norm_rope_(
         query[text_len:], key[text_len:], norm_weights[0], norm_weights[1],
-        torch.view_as_real(image_freqs.resolve_conj()), norm_eps[0], norm_eps[1],
+        torch.view_as_real(image_freqs.resolve_conj()), norm_eps[0], norm_eps[1], batch_size,
     )
     return query, key, value
 
@@ -258,9 +308,21 @@ def _(
     image: torch.Tensor,
     text: torch.Tensor,
     image_weights: list[torch.Tensor],
-    *args: object,
+    image_biases: list[torch.Tensor],
+    text_weights: list[torch.Tensor],
+    text_biases: list[torch.Tensor],
+    packed_text_weight: torch.Tensor | None,
+    packed_text_bias: torch.Tensor | None,
+    packed_text_versions: list[int],
+    image_freqs: torch.Tensor,
+    text_freqs: torch.Tensor,
+    norm_weights: list[torch.Tensor],
+    norm_eps: list[float],
+    batch_size: int,
+    first_block_text_qkv: list[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    shape = (text.shape[0] + image.shape[0], image_weights[0].shape[0])
+    text_len = text.shape[0] * batch_size if first_block_text_qkv else text.shape[0]
+    shape = (text_len + image.shape[0], image_weights[0].shape[0])
     return image.new_empty(shape), image.new_empty(shape), image.new_empty(shape)
 
 

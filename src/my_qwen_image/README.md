@@ -122,7 +122,7 @@ Call `model.enable_inference_optimizations()` after loading weights and completi
 
 3. **QK RMSNorm + RoPE fusion.** `qk_norm_rope_` normalizes and rotates Q/K in place in the joint buffers, separately for text and image. It combines FP32 RMS reduction, learned scaling, and RoPE in one Triton launch per stream, preserving the intermediate BF16 casts. This path was verified on the RTX PRO 5000 SM12.0 GPU.
 
-4. **Packed text QKV and linear + GELU.** When a text mask is supplied, eligible batch-size-1 inference uses cached concatenated text Q/K/V weights for one GEMM, then copies its three outputs into the joint buffers. The image and text MLPs use `torch._addmm_activation(..., use_gelu=True)` for the first linear layer and tanh GELU epilogue. The [full-model ablation](#linear--gelu-ablation) measures this fusion's contribution; `fuse_linear_gelu=False` disables it independently.
+4. **Packed text QKV and linear + GELU.** When a text mask is supplied, eligible inference uses cached concatenated text Q/K/V weights for one GEMM, then copies its three outputs into the joint buffers. The image and text MLPs use `torch._addmm_activation(..., use_gelu=True)` for the first linear layer and tanh GELU epilogue. The [full-model ablation](#linear--gelu-ablation) measures this fusion's contribution; `fuse_linear_gelu=False` disables it independently.
 
 5. **Reuse RoPE and serial CFG conditioning.** `prepare_inference_rope` prepares position embeddings for reuse across forwards with fixed dimensions. `forward_cfg` shares the timestep embedding and each block's modulation between the positive and negative branches of one CFG pair. Modulation is recomputed for every pair, so a new timestep receives fresh conditioning.
 
@@ -149,6 +149,106 @@ with torch.inference_mode():
 `model.forward_cfg(latents, text, negative_text, timestep, img_shapes=img_shapes, image_rotary_emb=rope)` returns the positive and negative predictions. It shares the timestep embedding and per-layer modulation within that pair. Each call computes modulation for its current timestep. Reusing RoPE requires matching image dimensions, text length, and device.
 
 `tests/my_qwen_image/benchmark_sglang.py` supports eager, full CUDA graph, and regional `torch.compile` execution. CUDA graph replay updates input tensors while keeping shapes and model weights fixed. Recapture after changing weights. Regional compilation calls `compile(dynamic=False, options={"triton.cudagraphs": False})` on each transformer block.
+
+## Group inference
+
+The group path supports independent images with the same resolution and prompt under a frozen rollout policy. Enable inference optimizations before preparing shared inputs.
+
+- **Batched joint attention.** For batches larger than one, the fused path arranges projection destinations in sequence-major order, applies each position's RoPE to all batch members, and presents separate batch entries to attention. Transposing the input streams into this layout requires copies. The benchmark compares this path with both serial inference and the original batched attention path.
+- **Shared text computation.** `prepare_inference_text` computes `txt_norm` and `txt_in` once for a singleton prompt and carries its mask. `prepare_inference_first_block_text` additionally prepares first-block text QKV for the current timestep and RoPE. After the first joint attention, text states evolve separately for each image.
+
+One timestep for a group of image latents can use the following calls. Positive and negative prompt embeddings in this example each have batch size one and the same text length.
+
+```python
+model.enable_inference_optimizations()
+with torch.inference_mode():
+    rope = model.prepare_inference_rope(img_shapes, prompt_embeds.shape[1])
+    positive_text = model.prepare_inference_text(prompt_embeds, prompt_mask)
+    negative_text = model.prepare_inference_text(negative_prompt_embeds, negative_prompt_mask)
+    positive_at_step = model.prepare_inference_first_block_text(positive_text, timestep, rope)
+    negative_at_step = model.prepare_inference_first_block_text(negative_text, timestep, rope)
+    positive, negative = model.forward_cfg(
+        latents, positive_at_step, negative_at_step, timestep, image_rotary_emb=rope
+    )
+```
+
+Prepared tensors are read-only and belong to the model instance, weights, device, dtype, and effective adapter configuration used during preparation. Reprepare affected values when these change. Projected text is reusable across timesteps; first-block QKV belongs to its specific timestep and RoPE. A captured graph must also be recaptured when its captured prepared data or model configuration changes.
+
+Using the benchmark environment above, compare the retained paths independently:
+
+```bash
+python -u tests/my_qwen_image/benchmark_group.py "$QWEN_IMAGE_TRANSFORMER" \
+  --group-size 8 --batch-size 8 --modes eager \
+  --cases baseline projection text batch-reference batch-fused
+python -u tests/my_qwen_image/benchmark_group.py "$QWEN_IMAGE_TRANSFORMER" \
+  --group-size 8 --batch-size 4 --modes eager --workloads cfg \
+  --cases baseline batch-fused batch-cfg
+python -u tests/my_qwen_image/benchmark_prompt_encode.py "$QWEN_IMAGE_MODEL"
+```
+
+`QWEN_IMAGE_MODEL` points to the complete checkpoint directory containing `text_encoder/` and `tokenizer/`. The encoder benchmark uses the official pipeline's `encode_prompt(..., num_images_per_prompt=8)` to encode each positive and negative prompt once and repeat its embeddings.
+
+The DiT benchmark uses three independent timestep probes at `0.99`, `0.5`, and `0.01`, and includes preparation in each timed group schedule. It reports sample throughput; CFG pairs contain two sample predictions. `batch-cfg` evaluates both CFG branches in one DiT call, so its effective batch is twice `--batch-size`. Output checks compare each image and branch against serial optimized BF16 inference. Coverage includes DiT forward and separate text encoding; full denoising, VAE decoding, and RL reward evaluation require their own measurements.
+
+The following results were measured on 2026-11-25 with the full 20,430,401,088-parameter checkpoint, RTX PRO 5000 72 GB GPUs, PyTorch 2.14.1+cu130, Diffusers 0.43.0, BF16, Flash SDPA, and linear + GELU enabled. Each DiT result is the median of three group schedules after one warmup. Every throughput ratio uses the serial baseline measured on the same physical GPU. Numerical acceptance requires finite outputs and maximum per-image, per-branch relative L2 error at most 2% against that baseline.
+
+### 1. Group modulation reuse (historical)
+
+Group-wide modulation reuse is not retained as of 2026-11-26: its measured throughput gain of 0.5–2.7% was too small to justify the additional code. The shared-timestep API and its benchmark cases were removed. The existing modulation reuse between the two branches of a single `forward_cfg` call remains.
+
+Validation on 2026-11-26 passed all 11 GPU regressions and 22 applicable tiny-model benchmark combinations for the retained paths. All 11 changed-input graph replays matched eager bitwise. The log is `$MY_DFS/work/mylws/outputs/my_qwen_image/group-reuse-revert/20261126/gpu-regression.log`.
+
+The experiment shared timestep embeddings and modulation across multiple forwards and preserved bitwise outputs in every measured case:
+
+| Execution | Workload | Timesteps per schedule | Serial schedule (ms) | Shared modulation (ms) | Throughput ratio |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Eager | Single forward | 3 | 11314.229 | 11108.791 | 1.0185 |
+| Eager | Serial CFG | 3 | 22441.117 | 22168.336 | 1.0123 |
+| CUDA graph | Single forward | 1 | 3738.000 | 3638.968 | 1.0272 |
+| CUDA graph | Serial CFG | 1 | 7358.284 | 7320.285 | 1.0052 |
+
+All rows use eight images at 1024×1024. Graph measurements use timestep `0.5` and include preparation in the captured schedule. Each graph also passed a changed-latent, changed-text, and changed-timestep replay comparison against eager with bitwise equality.
+
+### 2. Batched DiT
+
+The fused path increased throughput by about 14–16% over the existing attention fallback at the same batch size. The benefit over optimized serial inference depends on resolution. `Combined` denotes the historical configuration that also reused group-wide timestep conditioning, text projection, and first-block text QKV; these results are retained as experiment records and do not describe an available benchmark case. CFG branches ran serially in this table.
+
+| Resolution | Workload | Microbatch | Fused / serial throughput | Combined / serial throughput | Fused max relative L2 | Combined max relative L2 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 1024×1024 | Single | 2 | 1.0101 | 1.0233 | 1.811% | 1.566% |
+| 1024×1024 | CFG | 2 | 1.0093 | 1.0162 | **2.324%** | 1.800% |
+| 1024×1024 | Single | 4 | 0.9837 | 0.9880 | 1.020% | 1.069% |
+| 1024×1024 | CFG | 4 | 0.9864 | 0.9890 | 1.227% | 1.096% |
+| 1024×1024 | Single | 8 | 0.9071 | 0.9077 | 1.844% | 1.307% |
+| 1024×1024 | CFG | 8 | 0.8995 | 0.9087 | 1.844% | 1.360% |
+| 512×512 | Single | 8 | 1.3624 | 1.3541 | 0.936% | 0.839% |
+| 512×512 | CFG | 8 | 1.2964 | 1.2993 | **2.952%** | 1.577% |
+
+At 512×512, the fastest passing single-forward schedule took 2868.568 ms versus 3908.191 ms serially; the fastest passing CFG schedule used `Combined` and took 5731.523 ms versus 7446.896 ms. At 1024×1024, batch-2 `Combined` gave the best eager result, while larger batches reduced throughput. Its single-step CUDA graph throughput ratios were 1.0197 for single forward and 1.0064 for CFG, with maximum relative L2 of 0.551% in both cases.
+
+Merging positive and negative CFG branches into one call produced these separate results:
+
+| Resolution | Image microbatch / effective DiT batch | Merged / serial-B1 throughput | Merged / same-microbatch serial-CFG throughput | Max relative L2 |
+| --- | --- | ---: | ---: | ---: |
+| 1024×1024 | 2 / 4 | 0.9822 | 0.9732 | 1.227% |
+| 1024×1024 | 4 / 8 | 0.9028 | 0.9152 | 1.844% |
+| 512×512 | 4 / 8 | 1.2793 | 1.0378 | **2.952%** |
+
+### 3. Prompt reuse
+
+On 2026-11-25, the official BF16 text encoder on an RTX PRO 5000 took **430.570 ms** to encode the same positive and negative prompts independently for eight samples, versus **54.143 ms** to encode each prompt once and repeat its embeddings: **7.95× encoder throughput**. Both figures include group embedding preparation and are medians of three measurements after two warmups. Embeddings matched bitwise. The positive and negative prompts produced 22 and 13 valid tokens respectively; peak allocated memory was 15.508 and 15.507 GiB. These are encoder-only measurements. The log is `$MY_DFS/work/mylws/outputs/my_qwen_image/group-reuse/prompt-encode.log`.
+
+Within the DiT, text projection reuse alone gave throughput ratios of 0.9901 for single forward and 1.0019 for CFG. Adding first-block text QKV reuse gave 0.9929 and 1.0102; the CUDA graph ratios were 1.0021 and 0.9924. These cases preserved bitwise outputs and showed no consistent throughput gain at 256 text tokens.
+
+### Validation and limitations
+
+All 11 focused GPU regressions passed, covering batch layouts, arbitrary text masks, prepared tensor reuse without mutation, and compiled inference after checkpoint updates. CUDA graph replay matched each corresponding eager path bitwise on changed inputs.
+
+Bold errors in the tables exceed the unchanged 2% threshold. Those configurations are not accepted by this comparison. The 512×512 batch-8 attention fallback also failed at 2.824%; a matched comparison with joint attention fusion disabled on both batch-1 and batch-8 paths still showed 2.858% error. Batch arithmetic differences therefore occur without the new joint attention fusion. Prepared conditioning reduced the measured errors, but the results do not establish equivalence for complete denoising trajectories or RL log-probabilities. CFG merging was tested with equally sized, 256-token positive and negative inputs; real unequal-length prompts require compatible masks or separate branches.
+
+Logs are under `$MY_DFS/work/mylws/outputs/my_qwen_image/group-reuse/`: `dit-1024-eager-b2.log`, `dit-1024-eager-b4.log`, `dit-1024-eager-b8.log`, `dit-1024-graph-single.log`, `dit-1024-graph-cfg.log`, `dit-512-eager-b8.log`, `dit-512-eager-cfg-b4.log`, `dit-512-cfg-parity-diagnostic.log`, `kernel-regression.log`, and `prompt-encode.log`. The batch-2 1024 eager run and both 512 CFG comparison runs exited with numerical failures for the configurations identified above. Other full-model comparison runs passed.
+
+For current microbatch-2 and microbatch-4 comparisons, use the first group benchmark command with the corresponding `--batch-size` and `--cases baseline batch-reference batch-fused batch-cfg`. The retained 512×512 cases use `--image-size 512 --batch-size 8 --cases baseline batch-reference batch-fused`; the merged-CFG comparison uses the second command with `--image-size 512`. The retained one-step graph cases use `--modes graph --timesteps 0.5 --cases baseline text`. Historical modulation-only and `Combined` measurements remain available in the logs above.
 
 ## SGLang 优化参考
 
