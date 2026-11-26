@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from my_qwen_image import inference_kernels as kernels
 from my_qwen_image.transformer_qwenimage import (
+    QwenImageTransformer2DModel,
     RMSNorm,
     apply_rotary_emb_qwen,
 )
@@ -69,3 +70,56 @@ def test_fused_qk_norm_rope() -> None:
     assert torch.equal(joint_k[:skip], before_k[:skip])
     assert torch.equal(joint_q[:, dim:], before_q[:, dim:])
     assert torch.equal(joint_k[:, dim:], before_k[:, dim:])
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_joint_projection(packed: bool) -> None:
+    # Check direct GEMM writes and the order of the packed text projection in the joint buffer.
+    torch.manual_seed(42)
+    device, dtype = "cuda", torch.bfloat16
+    width, img_len, txt_len = 128, 19, 7
+    img = torch.randn(img_len, width, device=device, dtype=dtype)
+    txt = torch.randn(txt_len, width, device=device, dtype=dtype)
+    img_weights = [torch.randn(width, width, device=device, dtype=dtype) for _ in range(3)]
+    img_biases = [torch.randn(width, device=device, dtype=dtype) for _ in range(3)]
+    txt_weights = [torch.randn_like(img_weights[0]) for _ in range(3)]
+    txt_biases = [torch.randn_like(img_biases[0]) for _ in range(3)]
+
+    qkv = kernels.project_joint_qkv(
+        img, txt, img_weights, img_biases, txt_weights, txt_biases, pack_text=packed
+    )
+    for actual, iw, ib, tw, tb in zip(qkv, img_weights, img_biases, txt_weights, txt_biases):
+        expected = torch.cat([F.linear(txt, tw, tb), F.linear(img, iw, ib)])
+        torch.testing.assert_close(actual, expected, rtol=0.008, atol=0.008)
+
+
+def test_compiled_masked_forward_after_weight_load() -> None:
+    # Compiled masked forward uses the text value bias updated by load_state_dict.
+    torch.manual_seed(42)
+    device, dtype = "cuda", torch.bfloat16
+    model = QwenImageTransformer2DModel(
+        num_layers=1, attention_head_dim=32, num_attention_heads=2,
+        joint_attention_dim=64, axes_dims_rope=(8, 12, 12),
+    ).to(device, dtype=dtype).eval()
+    model.enable_inference_optimizations()
+    img = torch.randn(1, 16, 64, device=device, dtype=dtype)
+    txt = torch.randn(1, 8, 64, device=device, dtype=dtype)
+    mask = torch.tensor([[True, False, True, True, False, False, True, True]], device=device)
+    step = torch.tensor([0.5], device=device, dtype=dtype)
+    rope = model.pos_embed([[(1, 4, 4)]], max_txt_seq_len=txt.size(1), device=img.device)
+    kwargs = dict(
+        encoder_hidden_states_mask=mask, timestep=step, image_rotary_emb=rope, return_dict=False
+    )
+
+    compiled = torch.compile(model, dynamic=False, options={"triton.cudagraphs": False})
+    state = model.state_dict()
+    bias_name = "transformer_blocks.0.attn.add_v_proj.bias"
+    state[bias_name] = torch.full_like(state[bias_name], 20)
+    with torch.no_grad():
+        before = compiled(img, txt, **kwargs)[0]
+        model.load_state_dict(state)
+        actual = compiled(img, txt, **kwargs)[0]
+        expected = model(img, txt, **kwargs)[0]
+
+    assert not torch.allclose(before, expected, rtol=0.02, atol=0.02)
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)

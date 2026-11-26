@@ -184,3 +184,71 @@ def qk_norm_rope_(
         k.stride(0), freqs.stride(0), q_eps, k_eps, 4, triton.next_power_of_2(width),
         enable_fp_fusion=False,
     )
+
+
+def project_joint_qkv(
+    image: torch.Tensor,
+    text: torch.Tensor,
+    image_weights: list[torch.Tensor],
+    image_biases: list[torch.Tensor],
+    text_weights: list[torch.Tensor],
+    text_biases: list[torch.Tensor],
+    pack_text: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Contiguous [text, image] rows let GEMM use the cuBLASLt bias epilogue.
+    text_len = text.shape[0]
+    shape = (text_len + image.shape[0], image_weights[0].shape[0])
+    query, key, value = (image.new_empty(shape) for _ in range(3))
+    buffers = (query, key, value)
+    for out, weight, bias in zip(buffers, image_weights, image_biases):
+        torch.addmm(bias, image, weight.t(), out=out[text_len:])
+
+    if not pack_text:
+        for out, weight, bias in zip(buffers, text_weights, text_biases):
+            torch.addmm(bias, text, weight.t(), out=out[:text_len])
+    else:
+        packed_qkv = torch.nn.functional.linear(text, torch.cat(text_weights), torch.cat(text_biases))
+        for out, projection in zip(buffers, packed_qkv.chunk(3, dim=-1)):
+            out[:text_len].copy_(projection)
+    return query, key, value
+
+
+@torch.library.custom_op("my_qwen_image::joint_qkv", mutates_args=())
+def joint_qkv(
+    image: torch.Tensor,
+    text: torch.Tensor,
+    image_weights: list[torch.Tensor],
+    image_biases: list[torch.Tensor],
+    text_weights: list[torch.Tensor],
+    text_biases: list[torch.Tensor],
+    pack_text: bool,
+    image_freqs: torch.Tensor,
+    text_freqs: torch.Tensor,
+    norm_weights: list[torch.Tensor],
+    norm_eps: list[float],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    query, key, value = project_joint_qkv(
+        image, text, image_weights, image_biases, text_weights, text_biases, pack_text,
+    )
+    text_len = text.shape[0]
+    # Keep projection and in-place QK updates inside one functional op for the compiler.
+    qk_norm_rope_(
+        query[:text_len], key[:text_len], norm_weights[2], norm_weights[3],
+        torch.view_as_real(text_freqs.resolve_conj()), norm_eps[2], norm_eps[3],
+    )
+    qk_norm_rope_(
+        query[text_len:], key[text_len:], norm_weights[0], norm_weights[1],
+        torch.view_as_real(image_freqs.resolve_conj()), norm_eps[0], norm_eps[1],
+    )
+    return query, key, value
+
+
+@joint_qkv.register_fake
+def _(
+    image: torch.Tensor,
+    text: torch.Tensor,
+    image_weights: list[torch.Tensor],
+    *args: object,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    shape = (text.shape[0] + image.shape[0], image_weights[0].shape[0])
+    return image.new_empty(shape), image.new_empty(shape), image.new_empty(shape)
