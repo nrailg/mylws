@@ -6,18 +6,18 @@ Diffusers 与 SGLang 的对比见 [DiT 测试说明](../../tests/my_qwen_image/R
 
 ## 推理优化结果
 
-2026-11-25：优化后的实现在六组测试中，吞吐比 SGLang v0.5.23（`297e54f`）高 **12.7–15.0%**。两者均在同一张 RTX PRO 5000 72 GB GPU 上加载完整的 20,430,401,088 参数 checkpoint，使用 PyTorch 2.14.1+cu130、Diffusers 0.43.0、BF16 和 PyTorch SDPA FlashAttention。输入为 batch size 1、4096 个 image token、256 个 text token，seed 为 42。预热 4 次后，每组执行 3 轮、每轮计时 10 次，表中取 3 轮中位数；不计权重加载、编译和 graph capture。
+2026-11-26，使用按需打包 text QKV 权重的实现重新测量，六组吞吐比 SGLang v0.5.23（`297e54f`）高 **13.0–14.7%**。两者均在同一张 RTX PRO 5000 72 GB GPU 上加载完整的 20,430,401,088 参数 checkpoint，使用 PyTorch 2.14.1+cu130、Diffusers 0.43.0 和 BF16。计时使用 PyTorch SDPA FlashAttention。输入为 batch size 1、4096 个 image token、256 个 text token，seed 为 42。预热 4 次后，每组执行 3 轮、每轮计时 10 次，表中取 3 轮中位数。计时排除权重加载、编译和 graph capture。
 
 | 执行方式 | 负载 | 本地实现（ms） | SGLang（ms） | 本地吞吐 / SGLang |
 | --- | --- | ---: | ---: | ---: |
-| Eager | 单次 forward | 471.319 | 542.005 | 1.1500 |
-| Eager | 串行 CFG pair | 937.016 | 1063.217 | 1.1347 |
-| 完整 CUDA graph | 单次 forward | 474.016 | 536.049 | 1.1309 |
-| 完整 CUDA graph | 串行 CFG pair | 934.675 | 1070.735 | 1.1456 |
-| Regional compile | 单次 forward | 474.704 | 535.071 | 1.1272 |
-| Regional compile | 串行 CFG pair | 936.039 | 1063.255 | 1.1359 |
+| Eager | 单次 forward | 478.491 | 540.709 | 1.1300 |
+| Eager | 串行 CFG pair | 938.139 | 1067.043 | 1.1374 |
+| 完整 CUDA graph | 单次 forward | 475.413 | 539.608 | 1.1350 |
+| 完整 CUDA graph | 串行 CFG pair | 939.182 | 1077.027 | 1.1468 |
+| Regional compile | 单次 forward | 476.623 | 538.938 | 1.1307 |
+| Regional compile | 串行 CFG pair | 939.888 | 1062.912 | 1.1309 |
 
-SGLang 使用默认的 `lossless` quality，启用了全部 60 个 packed text QKV site 和原生 fused QK norm/RoPE kernel；其 SM12.x 条件判断关闭了全部 120 个 linear + GELU site。本地实现启用了 linear + GELU fusion。本地实现峰值分配显存为 41.4–41.6 GiB，SGLang 为 38.2–38.4 GiB。
+SGLang 使用默认的 `lossless` quality，启用了全部 60 个 packed text QKV site 和原生 fused QK norm/RoPE kernel。其 SM12.x 条件判断关闭了全部 120 个 linear + GELU site，本地实现启用了这项 fusion。计时阶段的峰值 allocated memory，本地为 38.18–38.39 GiB，SGLang 为 38.25–38.50 GiB。
 
 与官方 Diffusers 的数值验证要求输出均为有限值、relative L2 error 不超过 2%，并且每个 case 的本地 relative L2 error 不高于 SGLang。
 
@@ -27,7 +27,7 @@ SGLang 使用默认的 `lossless` quality，启用了全部 60 个 packed text Q
 | 0.5 | None | 0.5552% | 1.1021% | 0.125 | 0.3125 |
 | 0.01 | 231 valid / 256 | 0.5663% | 1.4297% | 0.375 | 0.75 |
 
-六项针对性 GPU 测试全部通过，覆盖 modulation broadcasting、strided QK/RoPE、packed projection，以及原地更新 checkpoint 后的 compiled inference。真实 PEFT 0.22.0 merge/unload 回归测试通过。对于变化后的输入，CUDA graph replay、regional compile 和串行 CFG 检查均与 eager 输出逐位一致。计时阶段 regional compile 没有创建新 graph。默认本地路径在三个完整 checkpoint case 中也都与官方 Diffusers 逐位一致。
+11 项 [CUDA 定向回归](../../tests/my_qwen_image/README.md#cuda-inference-regression)全部通过。变化输入下，CUDA graph replay、regional compile 和本地串行 CFG 实测与对应的 eager 输出逐位一致，benchmark 的验收阈值为 `rtol=0.02, atol=0.02`。计时阶段 regional compile 没有创建新 graph。逐位对齐官方 Diffusers 的测试使用未开启 fusion 的本地路径。
 
 在已验证的容器中从项目根目录运行。`QWEN_IMAGE_TRANSFORMER` 可以指向持久化 checkpoint，也可以指向下面使用的节点本地暂存副本。
 
@@ -35,21 +35,22 @@ SGLang 使用默认的 `lossless` quality，启用了全部 60 个 packed text Q
 source /opt/venvs/qwen-image-sglang-0523/bin/activate
 export SGLANG_SRC=/tmp/sglang-v0.5.23
 export CUDA_HOME=/tmp/mylws-qwen-cuda130/nvidia/cu13
+export PATH="$CUDA_HOME/bin:$PATH" LD_LIBRARY_PATH="$CUDA_HOME/lib:${LD_LIBRARY_PATH:-}"
 export PYTHONPATH="$SGLANG_SRC/python:$PWD/src"
-export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 MAX_JOBS=8 OMP_NUM_THREADS=8
-export CUDA_VISIBLE_DEVICES=1
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_ENABLE_PARALLEL_LOADING=YES
+export MAX_JOBS=8 OMP_NUM_THREADS=8 CUDA_VISIBLE_DEVICES=0
 QWEN_IMAGE_TRANSFORMER=/tmp/mylws-qwen-image.dxtonX
 python -m pytest -q tests/my_qwen_image/test_kernels.py
 python -u tests/my_qwen_image/benchmark_sglang.py "$QWEN_IMAGE_TRANSFORMER" \
   --sglang-revision-file "$SGLANG_SRC/REVISION" \
-  --models sglang local --modes eager graph compile
+  --models local sglang --modes eager graph compile
 ```
 
-固定版本的源码目录包含 `REVISION` 文件，隔离的 CUDA toolkit 使用 nvcc 13.0.88。日志和环境信息位于 `$MY_DFS/work/mylws/outputs/my_qwen_image/20261125-sglang-v0523/`，最终测量结果在 `benchmark.log` 中。节点本地路径仅适用于该容器。
+固定版本的源码目录包含 `REVISION` 文件，隔离的 CUDA toolkit 使用 nvcc 13.0.88。日志位于 `$MY_DFS/work/mylws/outputs/my_qwen_image/20261126-post-merge/`，完整模型结果见 `full-checkpoint.log`。节点本地路径仅适用于该容器。
 
 ### Linear + GELU 消融实验
 
-2026-11-25：仅关闭本地 linear + GELU fusion 后，本地吞吐比 SGLang 高 **1.1–2.5%**。其余优化保持开启。开启 fusion 的对照组、关闭 fusion 的实验组和重新测量的 SGLang baseline 使用相同的完整 checkpoint、GPU、runtime、输入和上述计时方法。
+2026-11-25，使用常驻 packed text QKV 权重的实现进行消融。仅关闭本地 linear + GELU fusion 后，本地吞吐比 SGLang 高 **1.1–2.5%**。其余优化保持开启。开启 fusion 的对照组、关闭 fusion 的实验组和重新测量的 SGLang baseline 使用相同的完整 checkpoint、GPU、runtime、输入和上述计时方法。
 
 | 执行方式 | 负载 | 本地开启 fusion（ms） | 本地关闭 fusion（ms） | SGLang（ms） | 关闭 fusion 后吞吐 / SGLang |
 | --- | --- | ---: | ---: | ---: | ---: |
@@ -76,7 +77,7 @@ python -u tests/my_qwen_image/benchmark_sglang.py "$QWEN_IMAGE_TRANSFORMER" \
 
 ### 限制
 
-性能测量覆盖无 mask 的单 GPU DiT forward 和串行 CFG pair，数值检查还覆盖 text padding。Fusion 会改变 BF16 舍入。在逐点 `rtol=0.02, atol=0.02` 标准下，本地三个 case 在 262144 个值中分别有 14、86 和 14919 个不匹配，SGLang 分别为 309、4771 和 55279 个。测量时使用的实现常驻了约 3.16 GiB packed text weights；当前实现仅在 masked input 出现时按需拼接这些权重，因此本文报告的耗时和显存数据来自此前的实现。CUDA graph 在 shape 或模型权重改变后需要重新 capture。
+性能测量覆盖无 mask 的单 GPU DiT forward 和串行 CFG pair，数值检查还覆盖 text padding。Fusion 会改变 BF16 舍入。在逐点 `rtol=0.02, atol=0.02` 标准下，本地三个 case 在 262144 个值中分别有 14、86 和 14919 个不匹配，SGLang 分别为 309、4771 和 55279 个。上述峰值显存来自无 mask 的稳态计时阶段。Masked path 会临时分配 packed text QKV 权重。CUDA graph 在 shape 或模型权重改变后需要重新 capture。
 
 ## 单卡 forward 对比
 
@@ -118,13 +119,13 @@ CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 HF_ENABLE_PARALLEL_LOADING=YES PYTHONPAT
 
 1. **融合 norm、modulation、gate 和 residual。** Triton `norm_modulate` 合并 LayerNorm 与 scale/shift；`residual_norm_modulate` 进一步合并前一个 gated residual update；`gated_residual` 合并 MLP gate 与 residual addition。这些 kernel 减少中间 tensor 读写和 kernel launch，同时为逐元素运算保留显式 BF16 舍入点。
 
-2. **直接写入 joint QKV buffer。** `project_joint_qkv` 分配行布局为 `[text, image]` 的 Q/K/V buffer。对于 dense batch-size-1 输入，六个 text/image projection 使用 `torch.addmm(..., out=...)` 直接写入目标切片，省去独立 projection buffer 和后续 `cat`。Masked path 保持相同 joint layout，并使用下述 packed text projection；padding mask 语义保持不变。
+2. **直接写入 joint QKV buffer。** `project_joint_qkv` 分配行布局为 `[text, image]` 的 Q/K/V buffer。无 text mask 时，六个 text/image projection 使用 `torch.addmm(..., out=...)` 直接写入目标切片，省去独立 projection buffer 和后续 `cat`。多样本 batch 使用 sequence-major 行布局，每个 token 位置的各样本行相邻。Attention 仍按样本独立计算。Image 和 text 输入的 batch size 必须相等。
 
 3. **融合 QK RMSNorm 与 RoPE。** `qk_norm_rope_` 分别对 text 和 image 的 joint buffer 切片原地完成 Q/K normalization 与 rotation。每条 stream 使用一次 Triton launch，合并 FP32 RMS reduction、learned scaling 和 RoPE，并保留中间 BF16 cast。该路径已在 RTX PRO 5000 SM12.0 GPU 上验证。
 
-4. **Packed text QKV 与 linear + GELU。** 传入 text mask 时，符合条件的 batch-size-1 inference 会拼接当前 text Q/K/V 的 weight 和 bias，以一次 GEMM 计算三个 projection，再将输出复制到 joint buffer。Image 和 text MLP 的第一个 linear layer 使用 `torch._addmm_activation(..., use_gelu=True)` 执行 tanh GELU epilogue。[完整模型消融实验](#linear--gelu-消融实验)测量了该 fusion 的贡献；`fuse_linear_gelu=False` 可以单独关闭它。
+4. **Packed text QKV 与 linear + GELU。** 传入 text mask 时，符合条件的 inference 会按需拼接当前 text Q/K/V 的 weight 和 bias，以一次 GEMM 计算三个 projection，再将输出复制到 joint buffer。该路径支持单样本和多样本 batch，并在 attention 中应用 text mask。Image 和 text MLP 的第一个 linear layer 使用 `torch._addmm_activation(..., use_gelu=True)` 执行 tanh GELU epilogue。[完整模型消融实验](#linear--gelu-消融实验)测量了该 fusion 的贡献，可用 `fuse_linear_gelu=False` 单独关闭它。
 
-5. **复用 RoPE 与串行 CFG conditioning。** `model.pos_embed` 为固定维度预先生成可跨 forward 复用的位置编码。`forward_cfg` 在一个 CFG pair 的 positive 与 negative 分支之间共享 timestep embedding 和每层 modulation。每个 CFG pair 都会重新计算 modulation，因此新 timestep 使用新的 conditioning。
+5. **复用 RoPE 与串行 CFG conditioning。** `model.pos_embed` 为固定维度预先生成可跨 forward 复用的位置编码。`forward_cfg` 在一个 CFG pair 的 positive 与 negative 分支之间共享 image projection、timestep embedding 和每层 modulation。每个 CFG pair 都会重新计算 modulation，因此新 timestep 使用新的 conditioning。
 
 6. **Regional `torch.compile` 与完整 CUDA graph。** Benchmark 为单次 forward 和串行 CFG 提供 block 级 compilation 与完整 forward graph capture。Compilation 通过 compiled region 减少 Python dispatch；graph replay 更新静态 input buffer，并复用已 capture 的 launch sequence。使用 `--modes` 显式选择这些模式；测量结果见上方性能表。
 
@@ -146,7 +147,7 @@ with torch.inference_mode():
     )[0]
 ```
 
-`model.forward_cfg(latents, text, negative_text, timestep, img_shapes=img_shapes, image_rotary_emb=rope)` 返回 positive 与 negative prediction，并在该 CFG pair 内共享 timestep embedding 和逐层 modulation。每次调用都会为当前 timestep 计算 modulation。复用 RoPE 时，image dimension、text length 和 device 必须一致。
+`model.forward_cfg(latents, text, negative_text, timestep, img_shapes=img_shapes, image_rotary_emb=rope)` 返回 positive 与 negative prediction。两个分支的 text length 不同时，传入 `img_shapes`，让 negative 分支生成适配自身长度的 RoPE。跨调用复用 RoPE 时，image dimension、text length 和 device 必须一致。
 
 `tests/my_qwen_image/benchmark_sglang.py` 支持 eager、完整 CUDA graph 和 regional `torch.compile`。CUDA graph replay 在 shape 和模型权重保持固定时更新输入 tensor；权重变化后需要重新 capture。Regional compilation 对每个 transformer block 调用 `compile(dynamic=False, options={"triton.cudagraphs": False})`。
 
@@ -214,13 +215,21 @@ DiT 性能测试使用 `0.99`、`0.5` 和 `0.01` 三个独立 timestep probe，�
 
 ### 3. Prompt 复用
 
-2026-11-25，在 RTX PRO 5000 上使用官方 BF16 text encoder，为 8 个 sample 分别编码相同的 positive 和 negative prompt 耗时 **430.570 ms**；每个 prompt 只编码一次并重复其 embeddings 耗时 **54.143 ms**，encoder throughput 提升 **7.95×**。两个结果都包含 group embedding 准备开销，并在预热两次后测量三次，取中位数。两条路径产生的 embeddings 逐位一致。Positive 和 negative prompt 分别生成 22 和 13 个 valid token；峰值 allocated memory 分别为 15.508 和 15.507 GiB。以上仅为 encoder 测量。日志位于 `$MY_DFS/work/mylws/outputs/my_qwen_image/group-reuse/prompt-encode.log`。
+2026-11-26，在 RTX PRO 5000 上使用官方 BF16 text encoder，为 8 个 sample 分别编码相同的 positive 和 negative prompt 耗时 **427.621 ms**。每个 prompt 编码一次并重复 embeddings 耗时 **53.628 ms**，encoder throughput 提升 **7.97×**。两个结果都包含 group embedding 准备开销，并在预热两次后测量三次，取中位数。两条路径产生的 embeddings 逐位一致。Positive 和 negative prompt 分别生成 22 和 13 个 valid token。峰值 allocated memory 分别为 15.508 和 15.507 GiB。以上仅为 encoder 测量。
 
 在 PR #8 的独立历史 DiT 实验中，仅复用 text projection 时，单次 forward 和 CFG 的吞吐比分别为 0.9901 和 1.0019。加入首层 text QKV 复用后分别为 0.9929 和 1.0102；CUDA graph 的吞吐比分别为 1.0021 和 0.9924。这些 case 的输出逐位一致，但在 256 个 text token 下没有稳定的吞吐收益。该实验保留在此处供参考。当前 benchmark 仅暴露 batching case。
 
 ### 验证与限制
 
-全部 11 项 GPU 定向回归测试均通过，覆盖 batch layout、任意 text mask、prepared tensor 的只读复用，以及 checkpoint 更新后的 compiled inference。使用变化输入时，CUDA graph replay 与对应 eager 路径逐位一致。
+2026-11-26，使用完整 checkpoint 对 512×512、group size 2、microbatch 2、timestep `0.5` 做合并后回归。Eager 和 CUDA graph 下的串行 baseline、普通 batch、fused batch 和 CFG 合批均通过。各样本和分支相对串行 baseline 的最大 relative L2 error 为 0.825%。变化输入下，所有 graph replay 与对应 eager 路径逐位一致。多图回归和 prompt 编码复测日志位于 `$MY_DFS/work/mylws/outputs/my_qwen_image/20261126-post-merge/group-and-prompt.log`。
+
+```bash
+python -u tests/my_qwen_image/benchmark_group.py "$QWEN_IMAGE_TRANSFORMER" \
+  --image-size 512 --group-size 2 --batch-size 2 --timesteps 0.5 --modes eager graph \
+  --cases baseline batch-reference batch-fused batch-cfg --repeats 1
+```
+
+历史 group 实验的 11 项 GPU 回归覆盖 batch layout、任意 text mask、当时的 prepared tensor 复用，以及 checkpoint 更新后的 compiled inference。使用变化输入时，CUDA graph replay 与对应 eager 路径逐位一致。
 
 表格中的粗体误差超过了保持不变的 2% 阈值，因此对应配置未通过本次验收。512×512 batch-8 attention fallback 也以 2.824% 的误差失败；在 batch-1 和 batch-8 路径上同时关闭 joint attention fusion 后进行匹配对比，误差仍为 2.858%。因此，即使不使用新增的 joint attention fusion，batch arithmetic 也会产生差异。Prepared conditioning 降低了实测误差，但这些结果不足以证明完整 denoising trajectory 或 RL log-probability 等价。CFG 合批使用长度相同的 256-token positive 和 negative input；真实的非等长 prompt 需要兼容的 mask 或使用独立分支。
 

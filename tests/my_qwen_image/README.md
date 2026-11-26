@@ -3,6 +3,19 @@
 Run from the repository root. Set `QWEN_IMAGE_TRANSFORMER` to the local
 `transformer/` directory of the full Qwen-Image checkpoint.
 
+## CUDA inference regression
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python -m pytest -q tests/my_qwen_image/test_kernels.py
+```
+
+On 2026-11-26, all 11 cases passed on an RTX PRO 5000 72 GB with PyTorch
+2.14.1+cu130, Diffusers 0.43.0, and Triton 3.8.0. Coverage includes masked
+and unmasked batched inference, mismatched batch rejection, compiled forward
+after a weight reload, and bitwise agreement between serial CFG and two
+independent forwards with unequal prompt lengths. The default fused GELU
+path is exercised by the model-level tests.
+
 ## Diffusers numerical alignment
 
 Use Diffusers 0.43.0. The standalone regression was verified with PyTorch
@@ -16,7 +29,12 @@ CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 HF_ENABLE_PARALLEL_LOADING=YES PYTHONPAT
 All three BF16 cases must match official Diffusers bitwise. The test uses
 Torch SDPA, seed 42, batch size 1, 4,096 image tokens, and 256 text tokens.
 It covers timesteps 1.0, 0.5, and 0.01, with a mask retaining 231 text tokens
-in the final case.
+in the final case. It runs without enabling inference optimizations. On
+2026-11-26 all three cases again matched bitwise on the CUDA regression
+environment above, with `max_abs=0` and `RMSE=0`.
+
+Logs for both reruns are in
+`$MY_DFS/work/mylws/outputs/my_qwen_image/20261126-post-merge/`.
 
 ## SGLang DiT numerical alignment
 

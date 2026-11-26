@@ -57,6 +57,7 @@ def norm_modulate(
     mod: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
+    """融合 LayerNorm 与 timestep modulation。"""
     batch, seq, width = x.shape
     out = torch.empty_like(x)
     mod_stride = mod.stride(0) if mod.shape[0] > 1 else 0

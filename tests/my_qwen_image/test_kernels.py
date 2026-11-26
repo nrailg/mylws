@@ -127,6 +127,22 @@ def test_compiled_masked_forward_after_weight_load(batch_size: int) -> None:
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
 
 
+@torch.no_grad()
+def test_joint_attention_rejects_mismatched_batches() -> None:
+    """验证 joint attention 会在处理 QKV 前拒绝不同的 image 和 text batch size。"""
+    device, dtype = "cuda", torch.bfloat16
+    model = QwenImageTransformer2DModel(
+        num_layers=1, attention_head_dim=32, num_attention_heads=2,
+        joint_attention_dim=64, axes_dims_rope=(8, 12, 12),
+    ).to(device, dtype=dtype).eval()
+    model.enable_inference_optimizations()
+    image = torch.zeros(2, 16, 64, device=device, dtype=dtype)
+    text = torch.zeros(1, 8, 64, device=device, dtype=dtype)
+    timestep = torch.full((2,), 0.5, device=device, dtype=dtype)
+    with pytest.raises(AssertionError, match="Image and text batch sizes must match"):
+        model(image, text, timestep=timestep, img_shapes=[[(1, 4, 4)]])
+
+
 @pytest.mark.parametrize("batch_size, masked", [(2, False), (4, True)])
 @torch.no_grad()
 def test_batched_forward_matches_individual_samples(batch_size: int, masked: bool) -> None:
@@ -153,3 +169,32 @@ def test_batched_forward_matches_individual_samples(batch_size: int, masked: boo
         for i in range(batch_size)
     ])
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+
+
+@torch.no_grad()
+def test_serial_cfg_matches_independent_forwards() -> None:
+    """验证不同 text length 的串行 CFG 复用 image projection 后与独立 forward 逐位一致。"""
+    torch.manual_seed(42)
+    device, dtype = "cuda", torch.bfloat16
+    model = QwenImageTransformer2DModel(
+        num_layers=2, attention_head_dim=32, num_attention_heads=2,
+        joint_attention_dim=64, axes_dims_rope=(8, 12, 12),
+    ).to(device, dtype=dtype).eval()
+    model.enable_inference_optimizations()
+    image = torch.randn(1, 16, 64, device=device, dtype=dtype)
+    positive = torch.randn(1, 8, 64, device=device, dtype=dtype)
+    negative = torch.randn(1, 5, 64, device=device, dtype=dtype)
+    negative_mask = torch.tensor([[True, False, True, True, False]], device=device)
+    timestep = torch.tensor([0.5], device=device, dtype=dtype)
+    img_shapes = [[(1, 4, 4)]]
+
+    actual_positive, actual_negative = model.forward_cfg(
+        image, positive, negative, timestep, img_shapes=img_shapes,
+        negative_encoder_hidden_states_mask=negative_mask,
+    )
+    expected_positive = model(image, positive, timestep=timestep, img_shapes=img_shapes).sample
+    expected_negative = model(
+        image, negative, negative_mask, timestep, img_shapes=img_shapes,
+    ).sample
+    torch.testing.assert_close(actual_positive, expected_positive, rtol=0, atol=0)
+    torch.testing.assert_close(actual_negative, expected_negative, rtol=0, atol=0)

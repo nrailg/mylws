@@ -652,6 +652,8 @@ class QwenDoubleStreamAttnProcessor2_0:
         if encoder_hidden_states is None:
             raise ValueError("QwenDoubleStreamAttnProcessor2_0 requires encoder_hidden_states (text stream)")
 
+        assert hidden_states.shape[0] == encoder_hidden_states.shape[0], "Image and text batch sizes must match"
+
         if attention_mask is not None:
             raise ValueError(
                 "QwenDoubleStreamAttnProcessor2_0 does not accept an external attention_mask. "
@@ -805,7 +807,7 @@ class QwenImageTransformerBlock(nn.Module):
             and not mlp._forward_hooks
             and not activation._forward_pre_hooks
             and not activation._forward_hooks
-            and _plain_linear(activation.proj, x)
+            and _use_plain_linear(activation.proj, x)
         ):
             x = self._inference_kernels.linear_gelu(x, activation.proj.weight, activation.proj.bias)
             return mlp.net[2](mlp.net[1](x))
@@ -1013,7 +1015,7 @@ class QwenImageTransformer2DModel(
         self.zero_cond_t = zero_cond_t
 
     def enable_inference_optimizations(self, *, fuse_linear_gelu: bool = True) -> None:
-        """Prepare BF16 CUDA inference for the current device and weights."""
+        """为当前设备和权重启用 BF16 CUDA 推理优化。"""
         # Load Triton when the caller enables CUDA inference optimizations.
         from . import inference_kernels
 
@@ -1038,7 +1040,7 @@ class QwenImageTransformer2DModel(
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         additional_t_cond: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return positive and negative predictions from serial CFG at the same timestep."""
+        """返回同一 timestep 的 serial CFG positive 和 negative prediction。"""
         assert not self.training, "forward_cfg requires eval mode"
         positive_image = self.img_in(hidden_states)
         temb, modulate_index = self._timestep_conditioning(
@@ -1069,7 +1071,7 @@ class QwenImageTransformer2DModel(
             temb, modulate_index, image_rotary_emb, None, None, modulation,
         )
         negative = self._forward_transformer(
-            self.img_in(hidden_states), negative_encoder_hidden_states, negative_encoder_hidden_states_mask,
+            positive_image, negative_encoder_hidden_states, negative_encoder_hidden_states_mask,
             temb, modulate_index, negative_rotary_emb, None, None, modulation,
         )
         return positive, negative
