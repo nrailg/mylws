@@ -15,7 +15,7 @@
 import math
 from math import prod
 from types import ModuleType
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -496,6 +496,42 @@ def _plain_linear(layer: nn.Module, x: torch.Tensor) -> bool:
     )
 
 
+class QwenInferenceText(NamedTuple):
+    """Read-only projected text, mask, and optional first-block QKV for one shared prompt."""
+
+    hidden_states: torch.Tensor
+    mask: torch.Tensor | None
+    first_block_qkv: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+
+
+def _text_seq_len(text: torch.Tensor | QwenInferenceText) -> int:
+    return (text.hidden_states if isinstance(text, QwenInferenceText) else text).shape[1]
+
+
+def _supports_fused_qk(
+    norms: tuple[nn.Module, nn.Module],
+    freq: torch.Tensor,
+    stream: torch.Tensor,
+    head_dim: int,
+) -> bool:
+    return (
+        freq.dtype == torch.complex64
+        and freq.device == stream.device
+        and freq.shape == (stream.shape[1], head_dim // 2)
+        and freq.stride(-1) == 1
+        and all(
+            type(norm) is RMSNorm
+            and norm.bias is None
+            and norm.weight is not None
+            and norm.weight.shape == (head_dim,)
+            and norm.weight.dtype == stream.dtype
+            and norm.weight.device == stream.device
+            and norm.weight.is_contiguous()
+            for norm in norms
+        )
+    )
+
+
 class QwenDoubleStreamAttnProcessor2_0:
     """
     Attention processor for Qwen double-stream architecture, matching DoubleStreamLayerMegatron logic. This processor
@@ -551,6 +587,7 @@ class QwenDoubleStreamAttnProcessor2_0:
         text: torch.Tensor,
         rope: tuple[torch.Tensor, torch.Tensor] | None,
         masked: bool,
+        first_block_text_qkv: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         kernels = self._inference_kernels
         if (
@@ -575,23 +612,9 @@ class QwenDoubleStreamAttnProcessor2_0:
 
         norms = (attn.norm_q, attn.norm_k, attn.norm_added_q, attn.norm_added_k)
         head_dim = attn.inner_dim // attn.heads
-        if not all(
-            type(norm) is RMSNorm
-            and norm.bias is None
-            and norm.weight is not None
-            and norm.weight.shape == (head_dim,)
-            and norm.weight.dtype == image.dtype
-            and norm.weight.device == image.device
-            and norm.weight.is_contiguous()
-            for norm in norms
-        ):
-            return None
-        if any(
-            freq.dtype != torch.complex64
-            or freq.device != image.device
-            or freq.shape != (stream.shape[1], head_dim // 2)
-            or freq.stride(-1) != 1
-            for freq, stream in zip(rope, (image, text))
+        if not (
+            _supports_fused_qk(norms[:2], rope[0], image, head_dim)
+            and _supports_fused_qk(norms[2:], rope[1], text, head_dim)
         ):
             return None
 
@@ -608,18 +631,40 @@ class QwenDoubleStreamAttnProcessor2_0:
         else:
             # Sequence-major rows keep each stream contiguous across the batch.
             image_rows = image.transpose(0, 1).flatten(0, 1)
-            text_rows = text.transpose(0, 1).flatten(0, 1)
+            text_rows = text[0] if first_block_text_qkv is not None else text.transpose(0, 1).flatten(0, 1)
         query, key, value = kernels.joint_qkv(
             image_rows, text_rows, image_weights, image_biases, text_weights, text_biases,
             packed_weight, packed_bias, packed_versions, rope[0], rope[1],
             [norm.weight for norm in norms], [norm.eps for norm in norms],
-            batch_size,
+            batch_size, [] if first_block_text_qkv is None else list(first_block_text_qkv),
         )
         if batch_size == 1:
             return tuple(buf.unflatten(-1, (-1, head_dim)).unsqueeze(0) for buf in (query, key, value))
         return tuple(
             buf.view(-1, batch_size, buf.shape[1] // head_dim, head_dim).transpose(0, 1)
             for buf in (query, key, value)
+        )
+
+    def _prepare_first_block_text_qkv(
+        self,
+        attn: Attention,
+        text: torch.Tensor,
+        freqs: torch.Tensor,
+        masked: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        projections = (attn.add_q_proj, attn.add_k_proj, attn.add_v_proj)
+        norms = (attn.norm_added_q, attn.norm_added_k)
+        assert self._parallel_config is None
+        assert all(_plain_linear(layer, text) for layer in projections)
+        assert _supports_fused_qk(norms, freqs, text, attn.inner_dim // attn.heads)
+        weights = [layer.weight for layer in projections]
+        biases = [layer.bias for layer in projections]
+        packed_weight, packed_bias, packed_versions = (
+            self._packed_text_parameters(weights, biases) if masked else (None, None, [])
+        )
+        return self._inference_kernels.prepare_text_qkv(
+            text[0], weights, biases, packed_weight, packed_bias, packed_versions, freqs,
+            [norm.weight for norm in norms], [norm.eps for norm in norms],
         )
 
     @staticmethod
@@ -684,6 +729,7 @@ class QwenDoubleStreamAttnProcessor2_0:
         encoder_hidden_states_mask: torch.FloatTensor = None,
         attention_mask: torch.FloatTensor | None = None,
         image_rotary_emb: torch.Tensor | None = None,
+        first_block_text_qkv: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if encoder_hidden_states is None:
             raise ValueError("QwenDoubleStreamAttnProcessor2_0 requires encoder_hidden_states (text stream)")
@@ -703,9 +749,11 @@ class QwenDoubleStreamAttnProcessor2_0:
         seq_txt = encoder_hidden_states.shape[1]
 
         joint_qkv = self._joint_qkv(
-            attn, hidden_states, encoder_hidden_states, image_rotary_emb, attention_mask is not None
+            attn, hidden_states, encoder_hidden_states, image_rotary_emb, attention_mask is not None,
+            first_block_text_qkv,
         )
         if joint_qkv is None:
+            assert first_block_text_qkv is None, "prepared first-block text requires fused QKV"
             joint_qkv = self._reference_joint_qkv(
                 attn, hidden_states, encoder_hidden_states, image_rotary_emb
             )
@@ -863,6 +911,7 @@ class QwenImageTransformerBlock(nn.Module):
         joint_attention_kwargs: dict[str, Any] | None = None,
         modulate_index: list[int] | None = None,
         modulation: tuple[torch.Tensor, torch.Tensor] | None = None,
+        first_block_text_qkv: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         img_mod_params, txt_mod_params = self._modulation(temb) if modulation is None else modulation
 
@@ -883,14 +932,21 @@ class QwenImageTransformerBlock(nn.Module):
         )
         if fused:
             img_modulated = kernels.norm_modulate(hidden_states, img_mod1, self.img_norm1.eps)
-            txt_modulated = kernels.norm_modulate(encoder_hidden_states, txt_mod1, self.txt_norm1.eps)
+            txt_modulated = (
+                kernels.norm_modulate(encoder_hidden_states, txt_mod1, self.txt_norm1.eps)
+                if first_block_text_qkv is None
+                else encoder_hidden_states
+            )
         else:
+            assert first_block_text_qkv is None, "prepared first-block text requires fused modulation"
             img_modulated, img_gate1 = self._modulate(
                 self.img_norm1(hidden_states), img_mod1, modulate_index
             )
             txt_modulated, txt_gate1 = self._modulate(self.txt_norm1(encoder_hidden_states), txt_mod1)
 
         joint_attention_kwargs = joint_attention_kwargs or {}
+        if first_block_text_qkv is not None:
+            joint_attention_kwargs = {**joint_attention_kwargs, "first_block_text_qkv": first_block_text_qkv}
         img_attn_output, txt_attn_output = self.attn(
             hidden_states=img_modulated,
             encoder_hidden_states=txt_modulated,
@@ -1090,11 +1146,57 @@ class QwenImageTransformer2DModel(
         )
 
     @torch.no_grad()
+    def prepare_inference_text(
+        self,
+        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_mask: torch.Tensor | None = None,
+    ) -> QwenInferenceText:
+        """Project a singleton prompt and prepare its mask for reuse.
+
+        Prepare again if the prompt, mask, model instance, weights, device, dtype, or effective
+        adapter configuration or scale changes.
+        """
+        assert not self.training and encoder_hidden_states.shape[0] == 1
+        hidden_states = self.txt_in(self.txt_norm(encoder_hidden_states))
+        _, _, mask = compute_text_seq_len_from_mask(hidden_states, encoder_hidden_states_mask)
+        return QwenInferenceText(hidden_states, mask)
+
+    @torch.no_grad()
+    def prepare_inference_first_block_text(
+        self,
+        text: QwenInferenceText,
+        timestep: torch.Tensor,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
+    ) -> QwenInferenceText:
+        """Prepare first-block text QKV for a fixed timestep and RoPE in fused BF16 inference.
+
+        The reuse rules in `prepare_inference_text` also apply here. Prepare first-block QKV
+        again if the timestep or RoPE changes.
+        """
+        assert not self.training and not self.zero_cond_t and not self.config.use_additional_t_cond
+        block = self.transformer_blocks[0]
+        processor = block.attn.processor
+        assert isinstance(processor, QwenDoubleStreamAttnProcessor2_0)
+        assert block._inference_kernels is not None and processor._inference_kernels is not None
+        assert _use_inference_kernels(text.hidden_states) and text.hidden_states.shape[1] > 0
+        assert timestep.shape == (1,)
+        temb, _ = self._timestep_conditioning(timestep, self.img_in.weight, None, None, None)
+        txt_mod_params = block.txt_mod(temb)
+        txt_mod1, _ = txt_mod_params.chunk(2, dim=-1)
+        modulated = block._inference_kernels.norm_modulate(
+            text.hidden_states, txt_mod1, block.txt_norm1.eps
+        )
+        qkv = processor._prepare_first_block_text_qkv(
+            block.attn, modulated, image_rotary_emb[1], text.mask is not None
+        )
+        return QwenInferenceText(text.hidden_states, text.mask, qkv)
+
+    @torch.no_grad()
     def forward_cfg(
         self,
         hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        negative_encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | QwenInferenceText,
+        negative_encoder_hidden_states: torch.Tensor | QwenInferenceText,
         timestep: torch.Tensor,
         *,
         img_shapes: list[tuple[int, int, int]] | None = None,
@@ -1112,11 +1214,11 @@ class QwenImageTransformer2DModel(
         # Keep modulation local to each CFG pair so the next call uses its own timestep.
         modulation = tuple(block._modulation(temb) for block in self.transformer_blocks)
 
-        text_len = encoder_hidden_states.shape[1]
+        text_len = _text_seq_len(encoder_hidden_states)
         if image_rotary_emb is None:
             image_rotary_emb = self.prepare_inference_rope(img_shapes, text_len)
 
-        negative_text_len = negative_encoder_hidden_states.shape[1]
+        negative_text_len = _text_seq_len(negative_encoder_hidden_states)
         negative_rotary_emb = image_rotary_emb
         if negative_text_len != text_len:
             assert img_shapes is not None, "img_shapes required for different text lengths"
@@ -1136,9 +1238,9 @@ class QwenImageTransformer2DModel(
     def forward(
         self,
         hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor = None,
+        encoder_hidden_states: torch.Tensor | QwenInferenceText = None,
         encoder_hidden_states_mask: torch.Tensor = None,
-        timestep: torch.LongTensor = None,
+        timestep: torch.Tensor = None,
         img_shapes: list[tuple[int, int, int]] | None = None,
         guidance: torch.Tensor = None,  # TODO: this should probably be removed
         attention_kwargs: dict[str, Any] | None = None,
@@ -1155,11 +1257,12 @@ class QwenImageTransformer2DModel(
                 Input `hidden_states`.
             encoder_hidden_states (`torch.Tensor` of shape `(batch_size, text_sequence_length, joint_attention_dim)`):
                 Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
+                For shared-prompt inference, also accepts text prepared by `prepare_inference_text`.
             encoder_hidden_states_mask (`torch.Tensor` of shape `(batch_size, text_sequence_length)`, *optional*):
                 Mask for the encoder hidden states. Expected to have 1.0 for valid tokens and 0.0 for padding tokens.
                 Used in the attention processor to prevent attending to padding tokens. The mask can have any pattern
                 (not just contiguous valid tokens followed by padding) since it's applied element-wise in attention.
-            timestep ( `torch.LongTensor`):
+            timestep (`torch.Tensor`):
                 Used to indicate denoising step.
             img_shapes (`list[tuple[int, int, int]]`, *optional*):
                 Image shapes for RoPE computation.
@@ -1187,7 +1290,7 @@ class QwenImageTransformer2DModel(
         )
         if image_rotary_emb is None:
             image_rotary_emb = self.pos_embed(
-                img_shapes, max_txt_seq_len=encoder_hidden_states.shape[1], device=hidden_states.device
+                img_shapes, max_txt_seq_len=_text_seq_len(encoder_hidden_states), device=hidden_states.device
             )
         output = self._forward_transformer(
             hidden_states, encoder_hidden_states, encoder_hidden_states_mask, temb,
@@ -1231,7 +1334,7 @@ class QwenImageTransformer2DModel(
     def _forward_transformer(
         self,
         hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | QwenInferenceText,
         encoder_hidden_states_mask: torch.Tensor | None,
         temb: torch.Tensor,
         modulate_index: torch.Tensor | None,
@@ -1240,11 +1343,21 @@ class QwenImageTransformer2DModel(
         controlnet_block_samples: list[torch.Tensor] | None,
         modulation: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None,
     ) -> torch.Tensor:
-        encoder_hidden_states = self.txt_norm(encoder_hidden_states)
-        encoder_hidden_states = self.txt_in(encoder_hidden_states)
-        _, _, encoder_hidden_states_mask = compute_text_seq_len_from_mask(
-            encoder_hidden_states, encoder_hidden_states_mask
-        )
+        first_block_text_qkv = None
+        if isinstance(encoder_hidden_states, QwenInferenceText):
+            assert not self.training and not torch.is_grad_enabled()
+            assert encoder_hidden_states_mask is None, "prepared text already contains its mask"
+            text = encoder_hidden_states
+            batch_size = hidden_states.shape[0]
+            encoder_hidden_states = text.hidden_states.expand(batch_size, -1, -1).contiguous()
+            if text.mask is not None:
+                encoder_hidden_states_mask = text.mask.expand(batch_size, -1)
+            first_block_text_qkv = text.first_block_qkv
+        else:
+            encoder_hidden_states = self.txt_in(self.txt_norm(encoder_hidden_states))
+            _, _, encoder_hidden_states_mask = compute_text_seq_len_from_mask(
+                encoder_hidden_states, encoder_hidden_states_mask
+            )
 
         for index_block, block in enumerate(self.transformer_blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
@@ -1269,6 +1382,7 @@ class QwenImageTransformer2DModel(
                     joint_attention_kwargs=attention_kwargs,
                     modulate_index=modulate_index,
                     modulation=None if modulation is None else modulation[index_block],
+                    first_block_text_qkv=first_block_text_qkv if index_block == 0 else None,
                 )
 
             # controlnet residual

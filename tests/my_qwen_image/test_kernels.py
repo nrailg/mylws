@@ -156,3 +156,53 @@ def test_batched_forward_matches_individual_samples(batch_size: int, masked: boo
         for i in range(batch_size)
     ])
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@torch.no_grad()
+def test_prepared_group_text(batch_size: int) -> None:
+    # Check text reuse across distinct latents, CFG prompts, and timesteps.
+    torch.manual_seed(42)
+    device, dtype = "cuda", torch.bfloat16
+    model = QwenImageTransformer2DModel(
+        num_layers=2, attention_head_dim=32, num_attention_heads=2,
+        joint_attention_dim=64, axes_dims_rope=(8, 12, 12),
+    ).to(device, dtype=dtype).eval()
+    model.enable_inference_optimizations()
+    pos_txt = torch.randn(1, 8, 64, device=device, dtype=dtype)
+    neg_txt = torch.randn_like(pos_txt)
+    pos_mask = torch.tensor([[1, 0, 1, 1, 0, 0, 1, 1]], device=device)
+    neg_mask = torch.tensor([[True, True, False, True, True, False, True, False]], device=device)
+    rope = model.prepare_inference_rope([[(1, 4, 4)]], pos_txt.shape[1])
+    pos = model.prepare_inference_text(pos_txt, pos_mask)
+    neg = model.prepare_inference_text(neg_txt, neg_mask)
+    tol = 0.0 if batch_size == 1 else 0.02
+
+    for step_value in (0.5, 0.8):
+        step = torch.tensor([step_value], device=device, dtype=dtype)
+        pos_at_step = model.prepare_inference_first_block_text(pos, step, rope)
+        neg_at_step = model.prepare_inference_first_block_text(neg, step, rope)
+        cached_tensors = (
+            pos.hidden_states, neg.hidden_states, pos.mask, neg.mask,
+            *pos_at_step.first_block_qkv, *neg_at_step.first_block_qkv,
+        )
+        snapshots = [tensor.clone() for tensor in cached_tensors]
+
+        for _ in range(2):
+            img = torch.randn(batch_size, 16, 64, device=device, dtype=dtype)
+            reference = [
+                model.forward_cfg(
+                    sample.unsqueeze(0), pos_txt, neg_txt, step, image_rotary_emb=rope,
+                    encoder_hidden_states_mask=pos_mask, negative_encoder_hidden_states_mask=neg_mask,
+                )
+                for sample in img
+            ]
+            expected = tuple(torch.cat(branch) for branch in zip(*reference))
+            projected_only = model.forward_cfg(img, pos, neg, step, image_rotary_emb=rope)
+            cached = model.forward_cfg(img, pos_at_step, neg_at_step, step, image_rotary_emb=rope)
+            for actual in (projected_only, cached):
+                for output, expected_branch in zip(actual, expected):
+                    torch.testing.assert_close(output, expected_branch, rtol=tol, atol=tol)
+
+        for tensor, snapshot in zip(cached_tensors, snapshots):
+            torch.testing.assert_close(tensor, snapshot, rtol=0, atol=0)
