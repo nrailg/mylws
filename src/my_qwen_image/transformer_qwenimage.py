@@ -481,6 +481,20 @@ def _use_inference_kernels(x: torch.Tensor) -> bool:
     )
 
 
+def _plain_linear(layer: nn.Module, x: torch.Tensor) -> bool:
+    return (
+        type(layer) is nn.Linear
+        and type(layer.weight) is nn.Parameter
+        and layer.weight.dtype == x.dtype
+        and layer.weight.device == x.device
+        and layer.bias is not None
+        and layer.bias.dtype == x.dtype
+        and layer.bias.device == x.device
+        and not layer._forward_pre_hooks
+        and not layer._forward_hooks
+    )
+
+
 class QwenDoubleStreamAttnProcessor2_0:
     """
     Attention processor for Qwen double-stream architecture, matching DoubleStreamLayerMegatron logic. This processor
@@ -489,6 +503,9 @@ class QwenDoubleStreamAttnProcessor2_0:
 
     _attention_backend = None
     _parallel_config = None
+    _inference_kernels: ModuleType | None = None
+    _packed_text_qkv: tuple[torch.Tensor, torch.Tensor] | None = None
+    _packed_text_sources: tuple[tuple[torch.Tensor, int], ...] = ()
 
     def __init__(self):
         if not hasattr(F, "scaled_dot_product_attention"):
@@ -496,32 +513,107 @@ class QwenDoubleStreamAttnProcessor2_0:
                 "QwenDoubleStreamAttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0."
             )
 
-    def __call__(
+    @torch.no_grad()
+    def _prepare_packed_text_qkv(self, attn: Attention) -> None:
+        self._packed_text_qkv = None
+        self._packed_text_sources = ()
+        projections = (attn.add_q_proj, attn.add_k_proj, attn.add_v_proj)
+        if not all(type(layer) is nn.Linear for layer in projections):
+            return
+        weights = tuple(layer.weight for layer in projections)
+        biases = tuple(layer.bias for layer in projections)
+        if any(param is None or param.is_inference() for param in (*weights, *biases)):
+            return
+        self._packed_text_qkv = torch.cat(weights), torch.cat(biases)
+        self._packed_text_sources = tuple((param, param._version) for param in (*weights, *biases))
+
+    def _packed_text_parameters(
+        self,
+        weights: list[torch.Tensor],
+        biases: list[torch.Tensor],
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, list[int]]:
+        packed = self._packed_text_qkv
+        if packed is None or packed[0].device != weights[0].device or packed[0].dtype != weights[0].dtype:
+            return None, None, []
+        if any(
+            param is not source
+            for param, (source, _) in zip((*weights, *biases), self._packed_text_sources)
+        ):
+            return None, None, []
+        weight, bias = packed
+        return weight, bias, [version for _, version in self._packed_text_sources]
+
+    def _joint_qkv(
         self,
         attn: Attention,
-        hidden_states: torch.FloatTensor,  # Image stream
-        encoder_hidden_states: torch.FloatTensor = None,  # Text stream
-        encoder_hidden_states_mask: torch.FloatTensor = None,
-        attention_mask: torch.FloatTensor | None = None,
-        image_rotary_emb: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if encoder_hidden_states is None:
-            raise ValueError("QwenDoubleStreamAttnProcessor2_0 requires encoder_hidden_states (text stream)")
+        image: torch.Tensor,
+        text: torch.Tensor,
+        rope: tuple[torch.Tensor, torch.Tensor] | None,
+        masked: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        kernels = self._inference_kernels
+        if (
+            kernels is None
+            or attn.training
+            or self._parallel_config is not None
+            or not _use_inference_kernels(image)
+            or image.shape[0] != 1
+            or image.shape[1] == 0
+            or text.shape[1] == 0
+            or not text.is_contiguous()
+            or text.dtype != image.dtype
+            or rope is None
+        ):
+            return None
 
-        if attention_mask is not None:
-            raise ValueError(
-                "QwenDoubleStreamAttnProcessor2_0 does not accept an external attention_mask. "
-                "Pass encoder_hidden_states_mask to let the processor build the joint mask."
-            )
+        image_projections = (attn.to_q, attn.to_k, attn.to_v)
+        text_projections = (attn.add_q_proj, attn.add_k_proj, attn.add_v_proj)
+        if not all(_plain_linear(layer, image) for layer in (*image_projections, *text_projections)):
+            return None
 
-        if encoder_hidden_states_mask is not None:
-            seq_img = hidden_states.shape[1]
-            image_mask = torch.ones((hidden_states.shape[0], seq_img), dtype=torch.bool, device=hidden_states.device)
-            attention_mask = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
-            attention_mask = attention_mask[:, None, None, :]
+        norms = (attn.norm_q, attn.norm_k, attn.norm_added_q, attn.norm_added_k)
+        head_dim = attn.inner_dim // attn.heads
+        if not all(
+            type(norm) is RMSNorm
+            and norm.bias is None
+            and norm.weight is not None
+            and norm.weight.shape == (head_dim,)
+            and norm.weight.dtype == image.dtype
+            and norm.weight.device == image.device
+            and norm.weight.is_contiguous()
+            for norm in norms
+        ):
+            return None
+        if any(
+            freq.dtype != torch.complex64
+            or freq.device != image.device
+            or freq.shape != (stream.shape[1], head_dim // 2)
+            or freq.stride(-1) != 1
+            for freq, stream in zip(rope, (image, text))
+        ):
+            return None
 
-        seq_txt = encoder_hidden_states.shape[1]
+        image_weights = [layer.weight for layer in image_projections]
+        image_biases = [layer.bias for layer in image_projections]
+        text_weights = [layer.weight for layer in text_projections]
+        text_biases = [layer.bias for layer in text_projections]
+        packed_weight, packed_bias, packed_versions = (
+            self._packed_text_parameters(text_weights, text_biases) if masked else (None, None, [])
+        )
+        query, key, value = kernels.joint_qkv(
+            image[0], text[0], image_weights, image_biases, text_weights, text_biases,
+            packed_weight, packed_bias, packed_versions, rope[0], rope[1],
+            [norm.weight for norm in norms], [norm.eps for norm in norms],
+        )
+        return tuple(buf.unflatten(-1, (-1, head_dim)).unsqueeze(0) for buf in (query, key, value))
 
+    @staticmethod
+    def _reference_joint_qkv(
+        attn: Attention,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Compute QKV for image stream (sample projections)
         img_query = attn.to_q(hidden_states)
         img_key = attn.to_k(hidden_states)
@@ -567,6 +659,42 @@ class QwenDoubleStreamAttnProcessor2_0:
         joint_query = torch.cat([txt_query, img_query], dim=1)
         joint_key = torch.cat([txt_key, img_key], dim=1)
         joint_value = torch.cat([txt_value, img_value], dim=1)
+        return joint_query, joint_key, joint_value
+
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: torch.FloatTensor,  # Image stream
+        encoder_hidden_states: torch.FloatTensor = None,  # Text stream
+        encoder_hidden_states_mask: torch.FloatTensor = None,
+        attention_mask: torch.FloatTensor | None = None,
+        image_rotary_emb: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if encoder_hidden_states is None:
+            raise ValueError("QwenDoubleStreamAttnProcessor2_0 requires encoder_hidden_states (text stream)")
+
+        if attention_mask is not None:
+            raise ValueError(
+                "QwenDoubleStreamAttnProcessor2_0 does not accept an external attention_mask. "
+                "Pass encoder_hidden_states_mask to let the processor build the joint mask."
+            )
+
+        if encoder_hidden_states_mask is not None:
+            seq_img = hidden_states.shape[1]
+            image_mask = torch.ones((hidden_states.shape[0], seq_img), dtype=torch.bool, device=hidden_states.device)
+            attention_mask = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
+            attention_mask = attention_mask[:, None, None, :]
+
+        seq_txt = encoder_hidden_states.shape[1]
+
+        joint_qkv = self._joint_qkv(
+            attn, hidden_states, encoder_hidden_states, image_rotary_emb, attention_mask is not None
+        )
+        if joint_qkv is None:
+            joint_qkv = self._reference_joint_qkv(
+                attn, hidden_states, encoder_hidden_states, image_rotary_emb
+            )
+        joint_query, joint_key, joint_value = joint_qkv
 
         joint_hidden_states = dispatch_attention_fn(
             joint_query,
@@ -895,6 +1023,27 @@ class QwenImageTransformer2DModel(
 
         for block in self.transformer_blocks:
             block._inference_kernels = inference_kernels
+            processor = block.attn.processor
+            if isinstance(processor, QwenDoubleStreamAttnProcessor2_0):
+                processor._inference_kernels = inference_kernels
+                processor._prepare_packed_text_qkv(block.attn)
+
+    def _clear_packed_text_qkv(self) -> None:
+        for block in self.transformer_blocks:
+            processor = block.attn.processor
+            if isinstance(processor, QwenDoubleStreamAttnProcessor2_0):
+                processor._packed_text_qkv = None
+                processor._packed_text_sources = ()
+
+    def _apply(self, fn, recurse: bool = True):
+        # Release packed weights on the old device when .to() moves the model.
+        self._clear_packed_text_qkv()
+        return super()._apply(fn, recurse)
+
+    def unload_lora(self) -> None:
+        # PEFT merge changes parameters through .data. Clear packed weights before removing wrappers.
+        self._clear_packed_text_qkv()
+        super().unload_lora()
 
     def prepare_inference_rope(
         self,
