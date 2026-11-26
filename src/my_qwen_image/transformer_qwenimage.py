@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin
 from diffusers.models._modeling_parallel import ContextParallelInput, ContextParallelOutput
+from diffusers.models.activations import GELU
 from diffusers.models.attention import AttentionMixin, FeedForward
 from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.attention_processor import Attention
@@ -728,6 +729,7 @@ class QwenDoubleStreamAttnProcessor2_0:
 @maybe_allow_in_graph
 class QwenImageTransformerBlock(nn.Module):
     _inference_kernels: ModuleType | None = None
+    _fuse_linear_gelu: bool = True
 
     def __init__(
         self,
@@ -820,6 +822,23 @@ class QwenImageTransformerBlock(nn.Module):
             temb = temb.chunk(2, dim=0)[0]
         return img_mod_params, self.txt_mod(temb)
 
+    def _inference_mlp(self, mlp: FeedForward, x: torch.Tensor) -> torch.Tensor:
+        if not self._fuse_linear_gelu:
+            return mlp(x)
+        activation = mlp.net[0]
+        if (
+            type(activation) is GELU
+            and activation.approximate == "tanh"
+            and not mlp._forward_pre_hooks
+            and not mlp._forward_hooks
+            and not activation._forward_pre_hooks
+            and not activation._forward_hooks
+            and _plain_linear(activation.proj, x)
+        ):
+            x = self._inference_kernels.linear_gelu(x, activation.proj.weight, activation.proj.bias)
+            return mlp.net[2](mlp.net[1](x))
+        return mlp(x)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -873,9 +892,9 @@ class QwenImageTransformerBlock(nn.Module):
             encoder_hidden_states, txt_modulated2 = kernels.residual_norm_modulate(
                 encoder_hidden_states, txt_attn_output, txt_mod1, txt_mod2, self.txt_norm2.eps
             )
-            img_mlp_output = self.img_mlp(img_modulated2)
+            img_mlp_output = self._inference_mlp(self.img_mlp, img_modulated2)
             hidden_states = kernels.gated_residual(hidden_states, img_mlp_output, img_mod2)
-            txt_mlp_output = self.txt_mlp(txt_modulated2)
+            txt_mlp_output = self._inference_mlp(self.txt_mlp, txt_modulated2)
             encoder_hidden_states = kernels.gated_residual(encoder_hidden_states, txt_mlp_output, txt_mod2)
         else:
             hidden_states = hidden_states + img_gate1 * img_attn_output
@@ -1016,13 +1035,14 @@ class QwenImageTransformer2DModel(
         self.gradient_checkpointing = False
         self.zero_cond_t = zero_cond_t
 
-    def enable_inference_optimizations(self) -> None:
+    def enable_inference_optimizations(self, *, fuse_linear_gelu: bool = True) -> None:
         """Prepare BF16 CUDA inference for the current device and weights."""
         # Load Triton when the caller enables CUDA inference optimizations.
         from . import inference_kernels
 
         for block in self.transformer_blocks:
             block._inference_kernels = inference_kernels
+            block._fuse_linear_gelu = fuse_linear_gelu
             processor = block.attn.processor
             if isinstance(processor, QwenDoubleStreamAttnProcessor2_0):
                 processor._inference_kernels = inference_kernels
