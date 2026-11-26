@@ -96,7 +96,8 @@ def test_joint_projection(packed: bool) -> None:
         torch.testing.assert_close(actual, expected, rtol=0.008, atol=0.008)
 
 
-def test_compiled_masked_forward_after_weight_load() -> None:
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_compiled_masked_forward_after_weight_load(batch_size: int) -> None:
     # Compiled masked forward uses the text value bias updated by load_state_dict.
     torch.manual_seed(42)
     device, dtype = "cuda", torch.bfloat16
@@ -105,10 +106,11 @@ def test_compiled_masked_forward_after_weight_load() -> None:
         joint_attention_dim=64, axes_dims_rope=(8, 12, 12),
     ).to(device, dtype=dtype).eval()
     model.enable_inference_optimizations()
-    img = torch.randn(1, 16, 64, device=device, dtype=dtype)
-    txt = torch.randn(1, 8, 64, device=device, dtype=dtype)
+    img = torch.randn(batch_size, 16, 64, device=device, dtype=dtype)
+    txt = torch.randn(batch_size, 8, 64, device=device, dtype=dtype)
     mask = torch.tensor([[True, False, True, True, False, False, True, True]], device=device)
-    step = torch.tensor([0.5], device=device, dtype=dtype)
+    mask = mask.expand(batch_size, -1)
+    step = torch.full((batch_size,), 0.5, device=device, dtype=dtype)
     rope = model.prepare_inference_rope([[(1, 4, 4)]], txt.size(1))
     kwargs = dict(
         encoder_hidden_states_mask=mask, timestep=step, image_rotary_emb=rope, return_dict=False
@@ -125,4 +127,32 @@ def test_compiled_masked_forward_after_weight_load() -> None:
         expected = model(img, txt, **kwargs)[0]
 
     assert not torch.allclose(before, expected, rtol=0.02, atol=0.02)
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+
+
+@pytest.mark.parametrize("batch_size, masked", [(2, False), (4, True)])
+@torch.no_grad()
+def test_batched_forward_matches_individual_samples(batch_size: int, masked: bool) -> None:
+    # Check that the joint layout keeps distinct timesteps, prompts, and image rows in each sample.
+    torch.manual_seed(42)
+    device, dtype = "cuda", torch.bfloat16
+    model = QwenImageTransformer2DModel(
+        num_layers=2, attention_head_dim=32, num_attention_heads=2,
+        joint_attention_dim=64, axes_dims_rope=(8, 12, 12),
+    ).to(device, dtype=dtype).eval()
+    model.enable_inference_optimizations()
+    img = torch.randn(batch_size, 16, 64, device=device, dtype=dtype)
+    txt = torch.randn(batch_size, 8, 64, device=device, dtype=dtype)
+    mask = torch.rand(batch_size, 8, device=device) > 0.4 if masked else None
+    step = torch.linspace(0.3, 0.7, batch_size, device=device, dtype=dtype)
+    rope = model.prepare_inference_rope([[(1, 4, 4)]], txt.shape[1])
+
+    actual = model(img, txt, mask, step, image_rotary_emb=rope, return_dict=False)[0]
+    expected = torch.cat([
+        model(
+            img[i:i + 1], txt[i:i + 1], None if mask is None else mask[i:i + 1], step[i:i + 1],
+            image_rotary_emb=rope, return_dict=False,
+        )[0]
+        for i in range(batch_size)
+    ])
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
