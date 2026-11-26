@@ -120,3 +120,67 @@ def gated_residual(x: torch.Tensor, update: torch.Tensor, mod: torch.Tensor) -> 
         enable_fp_fusion=False,
     )
     return out
+
+
+@triton.jit
+def _qk_norm_rope(
+    Q,
+    K,
+    Q_WEIGHT,
+    K_WEIGHT,
+    FREQS,
+    SEQUENCE: tl.constexpr,
+    HEADS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    Q_STRIDE: tl.constexpr,
+    K_STRIDE: tl.constexpr,
+    FREQ_STRIDE: tl.constexpr,
+    EPS_Q: tl.constexpr,
+    EPS_K: tl.constexpr,
+    HEAD_ROWS: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0) * HEAD_ROWS + tl.arange(0, HEAD_ROWS)
+    is_key = tl.program_id(1) == 1
+    col = tl.arange(0, HEAD_BLOCK)
+    token = row // HEADS
+    head = row % HEADS
+    valid = (token[:, None] < SEQUENCE) & (col[None, :] < WIDTH)
+    pointer = tl.where(is_key, K, Q)
+    row_stride = tl.where(is_key, K_STRIDE, Q_STRIDE)
+    offset = token[:, None] * row_stride + head[:, None] * WIDTH + col[None, :]
+    x = tl.load(pointer + offset, valid, 0).to(tl.float32)
+    weight = tl.load(tl.where(is_key, K_WEIGHT, Q_WEIGHT) + col, col < WIDTH, 0).to(tl.float32)
+
+    variance = tl.sum(x * x, axis=1) / WIDTH
+    eps = tl.where(is_key, EPS_K, EPS_Q)
+    norm = _round_bf16(x * tl.rsqrt(variance + eps)[:, None])
+    norm = _round_bf16(norm * weight[None, :])
+
+    # view_as_real interleaves the real and imaginary components of complex64 RoPE.
+    freq_offset = token[:, None] * FREQ_STRIDE + (col[None, :] // 2) * 2
+    cos = tl.load(FREQS + freq_offset, valid, 0)
+    sin = tl.load(FREQS + freq_offset + 1, valid, 0)
+    partner = tl.gather(norm, tl.broadcast_to((col ^ 1)[None, :], (HEAD_ROWS, HEAD_BLOCK)), 1)
+    rotated = norm * cos + tl.where(col[None, :] % 2 == 0, -partner, partner) * sin
+    tl.store(pointer + offset, rotated, valid)
+
+
+@triton_op("my_qwen_image::qk_norm_rope_", mutates_args={"q", "k"})
+def qk_norm_rope_(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    freqs: torch.Tensor,
+    q_eps: float,
+    k_eps: float,
+) -> None:
+    seq = q.shape[0]
+    width = q_weight.numel()
+    heads = q.shape[-1] // width
+    wrap_triton(_qk_norm_rope)[(triton.cdiv(seq * heads, 4), 2)](
+        q, k, q_weight, k_weight, freqs, seq, heads, width, q.stride(0),
+        k.stride(0), freqs.stride(0), q_eps, k_eps, 4, triton.next_power_of_2(width),
+        enable_fp_fusion=False,
+    )
