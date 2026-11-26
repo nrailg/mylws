@@ -867,16 +867,6 @@ class QwenImageTransformer2DModel(
         self.gradient_checkpointing = False
         self.zero_cond_t = zero_cond_t
 
-    def prepare_inference_rope(
-        self,
-        img_shapes: list[tuple[int, int, int]],
-        text_seq_len: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Prepare RoPE for forwards with the same img_shapes, text_seq_len, and device."""
-        return self.pos_embed(
-            img_shapes, max_txt_seq_len=text_seq_len, device=self.img_in.weight.device
-        )
-
     @torch.no_grad()
     def forward_cfg(
         self,
@@ -902,13 +892,17 @@ class QwenImageTransformer2DModel(
 
         text_len = encoder_hidden_states.shape[1]
         if image_rotary_emb is None:
-            image_rotary_emb = self.prepare_inference_rope(img_shapes, text_len)
+            image_rotary_emb = self.pos_embed(
+                img_shapes, max_txt_seq_len=text_len, device=positive_image.device
+            )
 
         negative_text_len = negative_encoder_hidden_states.shape[1]
         negative_rotary_emb = image_rotary_emb
         if negative_text_len != text_len:
             assert img_shapes is not None, "img_shapes required for different text lengths"
-            negative_rotary_emb = self.prepare_inference_rope(img_shapes, negative_text_len)
+            negative_rotary_emb = self.pos_embed(
+                img_shapes, max_txt_seq_len=negative_text_len, device=positive_image.device
+            )
 
         positive = self._forward_transformer(
             positive_image, encoder_hidden_states, encoder_hidden_states_mask,
