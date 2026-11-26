@@ -526,7 +526,7 @@ class QwenDoubleStreamAttnProcessor2_0:
             or attn.training
             or self._parallel_config is not None
             or not _use_inference_kernels(image)
-            or image.shape[0] != 1
+            or image.shape[0] == 0
             or image.shape[1] == 0
             or text.shape[1] == 0
             or not text.is_contiguous()
@@ -566,12 +566,25 @@ class QwenDoubleStreamAttnProcessor2_0:
         image_biases = [layer.bias for layer in image_projections]
         text_weights = [layer.weight for layer in text_projections]
         text_biases = [layer.bias for layer in text_projections]
+        batch_size = image.shape[0]
+        if batch_size == 1:
+            image_rows, text_rows = image[0], text[0]
+        else:
+            # Sequence-major rows keep each stream contiguous across the batch.
+            image_rows = image.transpose(0, 1).flatten(0, 1)
+            text_rows = text.transpose(0, 1).flatten(0, 1)
         query, key, value = kernels.joint_qkv(
-            image[0], text[0], image_weights, image_biases, text_weights, text_biases,
+            image_rows, text_rows, image_weights, image_biases, text_weights, text_biases,
             masked, rope[0], rope[1],
             [norm.weight for norm in norms], [norm.eps for norm in norms],
+            batch_size,
         )
-        return tuple(buf.unflatten(-1, (-1, head_dim)).unsqueeze(0) for buf in (query, key, value))
+        if batch_size == 1:
+            return tuple(buf.unflatten(-1, (-1, head_dim)).unsqueeze(0) for buf in (query, key, value))
+        return tuple(
+            buf.view(-1, batch_size, buf.shape[1] // head_dim, head_dim).transpose(0, 1)
+            for buf in (query, key, value)
+        )
 
     @staticmethod
     def _reference_joint_qkv(

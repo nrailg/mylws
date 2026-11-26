@@ -130,6 +130,7 @@ def _qk_norm_rope(
     K_WEIGHT,
     FREQS,
     SEQUENCE: tl.constexpr,
+    BATCH: tl.constexpr,
     HEADS: tl.constexpr,
     WIDTH: tl.constexpr,
     Q_STRIDE: tl.constexpr,
@@ -158,7 +159,7 @@ def _qk_norm_rope(
     norm = _round_bf16(norm * weight[None, :])
 
     # view_as_real interleaves the real and imaginary components of complex64 RoPE.
-    freq_offset = token[:, None] * FREQ_STRIDE + (col[None, :] // 2) * 2
+    freq_offset = (token[:, None] // BATCH) * FREQ_STRIDE + (col[None, :] // 2) * 2
     cos = tl.load(FREQS + freq_offset, valid, 0)
     sin = tl.load(FREQS + freq_offset + 1, valid, 0)
     partner = tl.gather(norm, tl.broadcast_to((col ^ 1)[None, :], (HEAD_ROWS, HEAD_BLOCK)), 1)
@@ -175,12 +176,13 @@ def qk_norm_rope_(
     freqs: torch.Tensor,
     q_eps: float,
     k_eps: float,
+    batch_size: int = 1,
 ) -> None:
     seq = q.shape[0]
     width = q_weight.numel()
     heads = q.shape[-1] // width
     wrap_triton(_qk_norm_rope)[(triton.cdiv(seq * heads, 4), 2)](
-        q, k, q_weight, k_weight, freqs, seq, heads, width, q.stride(0),
+        q, k, q_weight, k_weight, freqs, seq, batch_size, heads, width, q.stride(0),
         k.stride(0), freqs.stride(0), q_eps, k_eps, 4, triton.next_power_of_2(width),
         enable_fp_fusion=False,
     )
@@ -195,7 +197,7 @@ def project_joint_qkv(
     text_biases: list[torch.Tensor],
     pack_text: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Contiguous [text, image] rows let GEMM use the cuBLASLt bias epilogue.
+    # Flatten sequence-major streams into contiguous [text, image] GEMM destinations.
     text_len = text.shape[0]
     shape = (text_len + image.shape[0], image_weights[0].shape[0])
     query, key, value = (image.new_empty(shape) for _ in range(3))
@@ -226,6 +228,7 @@ def joint_qkv(
     text_freqs: torch.Tensor,
     norm_weights: list[torch.Tensor],
     norm_eps: list[float],
+    batch_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     query, key, value = project_joint_qkv(
         image, text, image_weights, image_biases, text_weights, text_biases, pack_text,
@@ -234,11 +237,11 @@ def joint_qkv(
     # Keep projection and in-place QK updates inside one functional op for the compiler.
     qk_norm_rope_(
         query[:text_len], key[:text_len], norm_weights[2], norm_weights[3],
-        torch.view_as_real(text_freqs.resolve_conj()), norm_eps[2], norm_eps[3],
+        torch.view_as_real(text_freqs.resolve_conj()), norm_eps[2], norm_eps[3], batch_size,
     )
     qk_norm_rope_(
         query[text_len:], key[text_len:], norm_weights[0], norm_weights[1],
-        torch.view_as_real(image_freqs.resolve_conj()), norm_eps[0], norm_eps[1],
+        torch.view_as_real(image_freqs.resolve_conj()), norm_eps[0], norm_eps[1], batch_size,
     )
     return query, key, value
 
