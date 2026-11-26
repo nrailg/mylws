@@ -252,3 +252,15 @@ def _(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     shape = (text.shape[0] + image.shape[0], image_weights[0].shape[0])
     return image.new_empty(shape), image.new_empty(shape), image.new_empty(shape)
+
+
+@torch.library.custom_op("my_qwen_image::linear_gelu", mutates_args=())
+def linear_gelu(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    # SGLang v0.5.23 also uses the cuBLASLt tanh GELU epilogue.
+    out = torch._addmm_activation(bias, x.flatten(0, -2), weight.t(), use_gelu=True)
+    return out.unflatten(0, x.shape[:-1])
+
+
+@linear_gelu.register_fake
+def _(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], weight.shape[0]))
