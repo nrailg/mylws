@@ -47,9 +47,12 @@ Keep code simple and easy to read. mylws contains reusable lightweight implement
 
 ### Comments and docstrings
 
+- Add a concise Chinese docstring to every public function, class, and method. State its purpose and behavior; document parameters, returns, or constraints only when they are not clear from the signature.
+- When an internal function body exceeds 3 LoC, include at least one brief, single-line Chinese comment that states its main intent or constraint.
+- When a function body exceeds 5 LoC, separate logical blocks with blank lines. Add very brief Chinese comments only when a block's purpose or constraint is not obvious from the code.
 - Use comments for non-obvious intent, workarounds, reference lifetimes, shape, units, layout, or other constraints the code cannot express directly.
 - Put background, full workflows, and run instructions in the relevant implementation or example README. Omit line-by-line paraphrases, commented-out old code, and debugging history.
-- Helpers, private functions, and one-line wrappers usually need no docstring. Briefly document non-obvious interface constraints when needed. Avoid applying the full NumPy docstring template to simple examples.
+- Internal helpers and one-line wrappers need no docstring. Avoid applying the full NumPy docstring template to simple APIs.
 - Aim for one line per comment within a function. Omit comments that repeat names or obvious steps.
 - Flag meaningless comments or docstrings, unjustified interface probing, lazy imports, silent error recovery, and unrelated changes. Fix these issues in your own changes during self-review.
 
